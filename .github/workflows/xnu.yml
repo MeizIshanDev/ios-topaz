@@ -44,7 +44,7 @@ jobs:
   build:
     # macos-14 still ships Xcode 15.x: its iig matches the xnu-8796 IORPC ABI
     # (Xcode 16's iig emits IORPC.kernelContent, which this xnu lacks)
-    runs-on: macos-15
+    runs-on: macos-14
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
@@ -65,7 +65,8 @@ jobs:
           # (mig, ctf tools) needs a single executable, so point at wrappers
           sed -i '' 's|export CC="$(xcrun -find clang)"|export CC="$CCACHE_WRAP/clang"|; s|export CXX="$(xcrun -find clang++)"|export CXX="$CCACHE_WRAP/clang++"|' dxb/build.sh
           grep -c 'export CC="$CCACHE_WRAP/clang"' dxb/build.sh
-          sed -i '' 's|warning "Skipping patch.*|echo "FATAL: Failed to apply ${PATCH}: ${APPLY_CHECK}" >&2; exit 1|' dxb/build.sh
+          # our numbered patches must apply; blacktop's own unnumbered ones are normally skipped
+          sed -i '' 's#warning "Skipping patch.*#case "$(basename "$PATCH")" in [0-9]*) echo "FATAL: Failed to apply ${PATCH}: ${APPLY_CHECK}" >\&2; exit 1 ;; *) warning "Skipping patch ${PATCH}: ${APPLY_CHECK}" ;; esac#' dxb/build.sh
           grep -c 'FATAL: Failed to apply' dxb/build.sh
           ls dxb/patches
 
