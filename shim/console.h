@@ -2,9 +2,9 @@
 #include <stdint.h>
 
 #define FB_BASE		0x5c000000UL	/* reserved-memory cont_splash_region */
-#define FB_W		1080
-#define FB_H		2400
-#define FB_STRIDE	(FB_W * 4)	/* a8r8g8b8, matches mainline simplefb */
+#define FB_W		720
+#define FB_H		1650
+#define FB_STRIDE	(FB_W * 4)	/* 720 * 4 = 2880 bytes, a8r8g8b8, matches fog nt36525b */
 
 #define RED	0xffff0000U
 #define BLUE	0xff0000a0U

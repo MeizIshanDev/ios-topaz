@@ -265,6 +265,18 @@ static void gold_cpufreq_max(void)
 	con_hex2("CPUFREQ", "old=", old, "mhz=", best_khz / 1000);
 }
 
+static inline void silence_fog_vibrator(void)
+{
+	/* Redmi 10C (fog) vibrator on TLMM EAST GPIO 36: CFG = 0x00d24000, INOUT = 0x00d24004 */
+	/* Direct MMIO: GPIO_OUT=0, FUNC=0, GPIO_OE=1, PULL_DOWN=1 */
+	*(volatile uint32_t *)0x00d24004UL = 0x0u;
+	*(volatile uint32_t *)0x00d24000UL = (1u << 9) | 0x1u;
+	__asm__ volatile("dsb sy" ::: "memory");
+	/* Fallback: TrustZone SCM call QCOM_SCM_IO_WRITE (0x42000502) */
+	smc(0x42000502UL, 2UL, 0x00d24004UL, 0x0u);
+	smc(0x42000502UL, 2UL, 0x00d24000UL, (1u << 9) | 0x1u);
+}
+
 static void __attribute__((noreturn)) gold_main(uint64_t dtb)
 {
 	uint64_t mmfr0 = rsr("id_aa64mmfr0_el1");
@@ -284,6 +296,7 @@ static void __attribute__((noreturn)) gold_main(uint64_t dtb)
 		test_gic();
 		gold_gicr_prepare();
 		gold_cpufreq_max();
+		silence_fog_vibrator();
 		uint64_t gt = speed_ticks();
 		con_hex2("SPEED", "silver=", (uint32_t)silver_ticks, "gold=", (uint32_t)gt);
 		delay_ms(1000);
@@ -503,6 +516,7 @@ static uint32_t to_us(uint64_t ticks)
 
 void shim_main(uint64_t dtb)
 {
+	silence_fog_vibrator();
 	struct mmu_info mi;
 
 	/* An xnu payload in the ramdisk means: boot it (MMU stays off). */

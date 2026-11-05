@@ -22,7 +22,7 @@ HIGH_MEM_SIZE = 0x100000000
 # 3G + 4G = 7G up to 0x2_40000000. No fixed carve-out is above 0x63900000, and it
 # gives the kernel RAM below 4 GiB, which the GPU needs (it does not reach above).
 MID_PHYS_BASE = int(__import__("os").environ.get("MIDBASE", "0x80000000"), 16)
-MID_MEM_SIZE = int(__import__("os").environ.get("MIDSIZE", "0x1c0000000"), 16)
+MID_MEM_SIZE = int(__import__("os").environ.get("MIDSIZE", "0x140000000"), 16)
 # /arm-io children are relative to this; it must not be 0 (serial_init bails)
 SOC_BASE = 0x01000000
 
@@ -31,8 +31,8 @@ GICD, GICD_SIZE = 0x0f200000, 0x10000
 GICR, GICR_SIZE = 0x0f300000, 0x100000
 # cont_splash_region left lit by ABL
 FB, FB_SIZE = 0x5c000000, 0xf00000
-SWEET_ECID = 0x544f50415a000001  # 'TOPAZ' + 1, synthetic
-FB_W, FB_H, FB_STRIDE = 1080, 2400, 1080 * 4
+SWEET_ECID = 0x464f470000000001  # 'FOG' + 1, synthetic
+FB_W, FB_H, FB_STRIDE = 720, 1650, 720 * 4
 # Internal UFS host (ufshc@4804000 "ufs_mem"); QEMU virt has none
 UFS, UFS_SIZE = 0x04804000, 0x3000
 TIMEBASE = 19200000
@@ -102,9 +102,9 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
         ('crypto-hash-method', cstr('sha2-384')),
         # MobileGestalt's screen class: display-scale (u32, default 0) comes
         # from /chosen, the pixel size from IOMobileFramebuffer. Scale 0 makes
-        # SpringBoard's FBSDisplayMode "infxinf@0x" invalid. 1080x2400 @3x =
-        # 360x800 points (like iPhone X class devices).
-        ('display-scale', u32(3)),
+        # SpringBoard's FBSDisplayMode "infxinf@0x" invalid. 1125x2436 @3x =
+        # 375x812 points (standard iPhone X display class for D22AP).
+        ('display-scale', u32(2 if native else 3)),
         # XNU derives IOPlatformUUID (gethostuuid) from these on arm; without
         # them CFPreferences cannot use kCFPreferencesCurrentHost (no ByHost
         # files), so e.g. DataMigration never records LastSystemVersion and
@@ -192,11 +192,11 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
             ph(),
             ('device_type', cstr('display-subsystem')),
             ('compatible', cstr('sweet,display')),
-            # --native: present the real 1080x2400 panel (needed for direct MDP scanout,
+            # --native: present the real 720x1650 panel (needed for direct MDP scanout,
             # which must match the canvas: sweetfb_native=1 with a 1125x2436 canvas makes
             # backboardd ask for a hardware scaler that does not exist)
-            ('canvas-width', u32(1080 if native else 1125)),
-            ('canvas-height', u32(2400 if native else 2436)),
+            ('canvas-width', u32(720 if native else 1125)),
+            ('canvas-height', u32(1650 if native else 2436)),
         ])])
 
     fbcon = node('sweet-fbcon', [
@@ -243,7 +243,7 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
     # SweetPlatformExpert and CPU IONameMatch still use them.
     return node('device-tree', [
         ph(),
-        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,topaz') + cstr('xiaomi,sweet') + cstr('qcom,khaje') + cstr('AppleARM')),
+        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,fog') + cstr('xiaomi,topaz') + cstr('xiaomi,sweet') + cstr('qcom,khaje') + cstr('AppleARM')),
         ('model', cstr('iPhone10,3')),
         ('target-type', cstr('D22')),
         ('target-sub-type', cstr('D22AP')),
