@@ -13,7 +13,7 @@ Does not touch GPIO 36 (vibrator motor on fog).
 
 --- a/bsd/dev/sweet_touch.c
 +++ b/bsd/dev/sweet_touch.c
-@@ -1,568 +1,1399 @@
+@@ -1,568 +1,1401 @@
  /*
 - * SWEET SE7 FIFO I2C / GT9896 Yellowstone / Focaltech 54:52 bring-up.
 - * Call once after the scheduler is running; all work runs on one thread.
@@ -153,13 +153,15 @@ Does not touch GPIO 36 (vibrator motor on fog).
 +
 +#define GCC_APCS_CLOCK_BRANCH_ENA_VOTE  0x7900cU
 +#define GCC_CFG_AHB_BRANCH_ENA_VOTE     0x52008U
-+#define GCC_VOTE_QUP0_WRAP_CORE         0x03c0U     /* QUP0 Wrapper Core & AHB clocks */
-+#define GCC_VOTE_QUP0_SE0               0x0400U     /* Bit 10: QUP0 SE0 clock */
-+#define GCC_VOTE_QUP0_SE0_MASK          (GCC_VOTE_QUP0_WRAP_CORE | GCC_VOTE_QUP0_SE0) /* 0x07c0 */
++/* Khaje SM6225: bit 6 (M_AHB), bit 7 (S_AHB), bit 8 (WRAP0_CORE), bit 10 (SE0) = 0x05c0 */
++#define GCC_VOTE_QUP0_WRAP_CORE         ((1U << 6) | (1U << 7) | (1U << 8))
++#define GCC_VOTE_QUP0_SE0               (1U << 10)  /* Bit 10: QUP0 SE0 clock */
++#define GCC_VOTE_QUP0_SE0_MASK          (GCC_VOTE_QUP0_WRAP_CORE | GCC_VOTE_QUP0_SE0) /* 0x05c0 */
 +
-+#define GCC_QUPV3_WRAP0_S0_CBCR         0x1700cU    /* Halt/branch control for SE0 */
-+#define GCC_QUPV3_WRAP0_S0_CMD_RCGR     0x18010U    /* CMD_RCGR for SE0 */
-+#define GCC_QUPV3_WRAP0_S0_CFG_RCGR     0x18014U    /* CFG_RCGR for SE0 */
++/* Official drivers/clk/qcom/gcc-khaje.c: SE0 CBCR=0x1f144, CMD_RCGR=0x1f148, CFG_RCGR=0x1f14c */
++#define GCC_QUPV3_WRAP0_S0_CBCR         0x1f144U    /* Branch/Halt control for SE0 */
++#define GCC_QUPV3_WRAP0_S0_CMD_RCGR     0x1f148U    /* CMD_RCGR for SE0 */
++#define GCC_QUPV3_WRAP0_S0_CFG_RCGR     0x1f14cU    /* CFG_RCGR for SE0 */
 +
 +#define GCC_CBCR_CLK_ENABLE             (1U << 0)
 +#define GCC_CBCR_CLK_OFF                (1U << 31)  /* Bit 31: 1 = halted, 0 = running */
@@ -1824,8 +1826,8 @@ Does not touch GPIO 36 (vibrator motor on fog).
 +    if (!g_touch.tlmm_base || !g_touch.gcc_base || !g_touch.spi_base) {
 +        printf("SWEET TOUCH: ml_io_map failed (tlmm=%p gcc=%p spi=%p)\n",
 +               (void *)g_touch.tlmm_base, (void *)g_touch.gcc_base, (void *)g_touch.spi_base);
-+        thread_terminate(current_thread());
-+        return;
++        (void)thread_terminate(current_thread());
++        thread_block(THREAD_CONTINUE_NULL);
 +    }
 +
 +    /* Default touch coordinate range matches Redmi 10C 720x1650 panel */
@@ -1836,9 +1838,9 @@ Does not touch GPIO 36 (vibrator motor on fog).
 +
 +    /* 1. Initialize GCC clocks and TLMM WEST pins */
 +    if (sweet_touch_clocks_init() != 0) {
-+        printf("SWEET TOUCH: failed to initialize QUP0 SE0 clocks, thread exiting\n");
-+        thread_terminate(current_thread());
-+        return;
++        printf("SWEET TOUCH: failed to initialize QUP0 SE0 clocks, stopping touch thread\n");
++        (void)thread_terminate(current_thread());
++        thread_block(THREAD_CONTINUE_NULL);
 +    }
 +    sweet_touch_pins_init();
 +
