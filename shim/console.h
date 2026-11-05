@@ -16,6 +16,9 @@ extern volatile uint32_t *con_fb;
 
 void con_clear(uint32_t bg);
 void con_skip(void);
+/* free text wrapped to the screen width */
+void con_text(const char *s, uint32_t fg);
+int con_rows_left(void);
 void con_str(const char *label, const char *s);
 void con_hex(const char *label, uint64_t v);
 /* label, then "a=xxxxxxxx b=xxxxxxxx" style pairs of 32-bit values */

@@ -12,6 +12,7 @@
 #include <stdint.h>
 #include "console.h"
 #include "ufs.h"
+#include "logview.h"
 
 #define UFS_BASE	0x04804000UL	/* ufshc@4804000, topaz live FDT */
 
@@ -263,4 +264,77 @@ void test_ufs(void)
 	if (esz != 128 || nent > 128)
 		return;
 	list_partitions(elba, nent);
+}
+
+/* ---- log viewer (fastboot boot, see logview.c): READ(10) only ---- */
+
+#define SWEET_LOG_BLOCKS	1025u	/* xnu patch 0047: last blocks of userdata */
+
+static uint32_t lv_read(uint64_t lba, uint32_t count, void *buf)
+{
+	return (lba >> 32) ? 1 : read_blocks((uint32_t)lba, count, buf);
+}
+
+void log_view(void)
+{
+	static uint8_t ents[128 * 128] __attribute__((aligned(4096)));
+	static const char want[] = "userdata";
+	uint32_t hcs = ufs_rd(REG_HCS), ocs = 0, st = 0, rc = 1;
+
+	con_clear(BLUE);
+	con_str("LOGVIEW", "read-only: last boot's log");
+	if (!(ufs_rd(REG_HCE) & 1) || !(hcs & HCS_DP) || !(hcs & HCS_UTRLRDY) || ufs_rd(REG_UTRLDBR)) {
+		con_hex2("UFS", "not ready hcs=", hcs, "dbr=", ufs_rd(REG_UTRLDBR));
+		return;
+	}
+	/* As test_ufs: never ring a doorbell unless the host really uses our list. */
+	ufs_wr(REG_UTRLRSR, 0);
+	uintptr_t list = (uintptr_t)utrl;
+	ufs_wr(REG_UTRLBA, (uint32_t)list);
+	ufs_wr(REG_UTRLBAU, (uint32_t)(list >> 32));
+	ufs_wr(REG_UTRLRSR, 1);
+	if (ufs_rd(REG_UTRLBA) != (uint32_t)list || ufs_rd(REG_UTRLBAU) != (uint32_t)(list >> 32) ||
+	    !(ufs_rd(REG_UTRLRSR) & 1)) {
+		con_str("UFS", "list base not taken: stop");
+		return;
+	}
+	static const uint8_t tur[6] = { 0x00 };
+	for (int i = 0; i < 3 && rc; i++)
+		rc = scsi(0, tur, sizeof(tur), 0, 0, &ocs, &st);
+
+	if ((rc = read_blocks(1, 1, data)) != 0) {
+		con_hex("GPT read err", rc);
+		return;
+	}
+	if (data[0] != 'E' || data[1] != 'F' || data[2] != 'I' || data[3] != ' ') {
+		con_str("GPT", "no header at LBA 1");
+		return;
+	}
+	uint32_t nent = data[80] | data[81] << 8 | data[82] << 16, esz = data[84] | data[85] << 8;
+	uint32_t elba = data[72] | data[73] << 8;
+	if (esz != 128 || nent == 0 || nent > 128) {
+		con_hex2("GPT", "bad entries=", nent, "size=", esz);
+		return;
+	}
+	if ((rc = read_blocks(elba, (nent * 128 + BLOCK - 1) / BLOCK, ents)) != 0) {
+		con_hex("GPT read err", rc);
+		return;
+	}
+	for (uint32_t i = 0; i < nent; i++) {
+		const uint8_t *e = ents + i * 128;
+		int match = 1;
+		for (unsigned c = 0; c < sizeof(want); c++)
+			match = match && e[56 + 2 * c] == (uint8_t)want[c];
+		if (!match)
+			continue;
+		uint64_t first = le64(e + 32), last = le64(e + 40);
+		con_hex2("USERDATA", "lba=", (uint32_t)first, "blocks=", (uint32_t)(last - first + 1));
+		if (last - first + 1 < 2 * SWEET_LOG_BLOCKS) {
+			con_str("USERDATA", "too small");
+			return;
+		}
+		logview_scan(lv_read, last + 1 - SWEET_LOG_BLOCKS, data);
+		return;
+	}
+	con_str("GPT", "no userdata partition");
 }

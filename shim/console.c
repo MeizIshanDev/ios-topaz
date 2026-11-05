@@ -66,6 +66,25 @@ void con_skip(void)
 	row++;
 }
 
+void con_text(const char *s, uint32_t fg)
+{
+	int col = 0, cols = (FB_W - 2 * MARGIN) / CH_W;
+
+	while (*s) {
+		if (col == cols) {
+			row++;
+			col = 0;
+		}
+		put_char(col++, *s++, fg);
+	}
+	row++;
+}
+
+int con_rows_left(void)
+{
+	return (FB_H - 2 * MARGIN) / CH_H - row;
+}
+
 void con_str(const char *label, const char *s)
 {
 	put_str(0, label, YELLOW);

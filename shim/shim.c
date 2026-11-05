@@ -519,6 +519,16 @@ void shim_main(uint64_t dtb)
 	silence_fog_vibrator();
 	struct mmu_info mi;
 
+#ifdef LOGVIEW
+	/* Show the persistent log, keep it on screen, then reset (10 min). */
+	stage = "logview";
+	log_view();
+	con_skip();
+	con_str("DONE", "Vol Down+Power: fastboot");
+	delay_ms(600000);
+	reset(20);
+#endif
+
 	/* An xnu payload in the ramdisk means: boot it (MMU stays off). */
 	stage = "loader";
 	con_clear(RED);
