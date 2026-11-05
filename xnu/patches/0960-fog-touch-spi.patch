@@ -13,7 +13,7 @@ Does not touch GPIO 36 (vibrator motor on fog).
 
 --- a/bsd/dev/sweet_touch.c
 +++ b/bsd/dev/sweet_touch.c
-@@ -1,568 +1,1401 @@
+@@ -1,568 +1,1377 @@
  /*
 - * SWEET SE7 FIFO I2C / GT9896 Yellowstone / Focaltech 54:52 bring-up.
 - * Call once after the scheduler is running; all work runs on one thread.
@@ -152,11 +152,10 @@ Does not touch GPIO 36 (vibrator motor on fog).
 + * ============================================================================ */
 +
 +#define GCC_APCS_CLOCK_BRANCH_ENA_VOTE  0x7900cU
-+#define GCC_CFG_AHB_BRANCH_ENA_VOTE     0x52008U
-+/* Khaje SM6225: bit 6 (M_AHB), bit 7 (S_AHB), bit 8 (WRAP0_CORE), bit 10 (SE0) = 0x05c0 */
-+#define GCC_VOTE_QUP0_WRAP_CORE         ((1U << 6) | (1U << 7) | (1U << 8))
++/* Khaje SM6225: bit 6 (M_AHB), bit 7 (S_AHB), bit 8 (WRAP0_CORE), bit 9, bit 10 (SE0) = 0x07c0 */
++#define GCC_VOTE_QUP0_WRAP_CORE         ((1U << 6) | (1U << 7) | (1U << 8) | (1U << 9))
 +#define GCC_VOTE_QUP0_SE0               (1U << 10)  /* Bit 10: QUP0 SE0 clock */
-+#define GCC_VOTE_QUP0_SE0_MASK          (GCC_VOTE_QUP0_WRAP_CORE | GCC_VOTE_QUP0_SE0) /* 0x05c0 */
++#define GCC_VOTE_QUP0_SE0_MASK          (GCC_VOTE_QUP0_WRAP_CORE | GCC_VOTE_QUP0_SE0) /* 0x07c0 */
 +
 +/* Official drivers/clk/qcom/gcc-khaje.c: SE0 CBCR=0x1f144, CMD_RCGR=0x1f148, CFG_RCGR=0x1f14c */
 +#define GCC_QUPV3_WRAP0_S0_CBCR         0x1f144U    /* Branch/Halt control for SE0 */
@@ -467,50 +466,33 @@ Does not touch GPIO 36 (vibrator motor on fog).
 +    uint32_t cbcr;
 +    int timeout;
 +
-+    /* 1. Enable QUP0 Wrapper Core (0x03c0) + QUP0 SE0 Clock (0x0400) = 0x07c0 on APCS and CFG_AHB */
++    /* 1. Vote on QUP0 Wrapper + SE0 via non-secure APCS vote register (0x7900c) */
 +    vote = mmio_read32(g_touch.gcc_base, GCC_APCS_CLOCK_BRANCH_ENA_VOTE);
 +    vote |= GCC_VOTE_QUP0_SE0_MASK;
 +    mmio_write32(g_touch.gcc_base, GCC_APCS_CLOCK_BRANCH_ENA_VOTE, vote);
 +    (void)mmio_read32(g_touch.gcc_base, GCC_APCS_CLOCK_BRANCH_ENA_VOTE);
 +
-+    vote = mmio_read32(g_touch.gcc_base, GCC_CFG_AHB_BRANCH_ENA_VOTE);
-+    vote |= GCC_VOTE_QUP0_SE0_MASK;
-+    mmio_write32(g_touch.gcc_base, GCC_CFG_AHB_BRANCH_ENA_VOTE, vote);
-+    (void)mmio_read32(g_touch.gcc_base, GCC_CFG_AHB_BRANCH_ENA_VOTE);
-+
-+    /* 2. Configure RCG2 Frequency Generator for QUP0 SE0 (19.2 MHz XO / div 1) */
++    /* 2. Configure RCG2 for QUP0 SE0: XO parent (19.2 MHz), divider 1 */
 +    mmio_write32(g_touch.gcc_base, GCC_QUPV3_WRAP0_S0_CFG_RCGR, GCC_CFG_RCGR_SRC_XO_DIV1);
 +
 +    cmd = mmio_read32(g_touch.gcc_base, GCC_QUPV3_WRAP0_S0_CMD_RCGR);
 +    cmd |= GCC_CMD_RCGR_UPDATE;
 +    mmio_write32(g_touch.gcc_base, GCC_QUPV3_WRAP0_S0_CMD_RCGR, cmd);
 +
-+    for (timeout = 5000; timeout > 0; timeout--) {
++    for (timeout = 2000; timeout > 0; timeout--) {
 +        if ((mmio_read32(g_touch.gcc_base, GCC_QUPV3_WRAP0_S0_CMD_RCGR) & GCC_CMD_RCGR_UPDATE) == 0) {
 +            break;
 +        }
 +        touch_udelay(1);
 +    }
 +
-+    /* 3. Ensure Branch Clock is enabled and wait for bit 31 (CLK_OFF) to clear */
++    /* 3. Ensure Branch Clock is enabled */
 +    cbcr = mmio_read32(g_touch.gcc_base, GCC_QUPV3_WRAP0_S0_CBCR);
 +    if ((cbcr & GCC_CBCR_CLK_ENABLE) == 0) {
 +        mmio_write32(g_touch.gcc_base, GCC_QUPV3_WRAP0_S0_CBCR, cbcr | GCC_CBCR_CLK_ENABLE);
 +    }
 +
-+    for (timeout = 10000; timeout > 0; timeout--) {
-+        cbcr = mmio_read32(g_touch.gcc_base, GCC_QUPV3_WRAP0_S0_CBCR);
-+        if ((cbcr & GCC_CBCR_CLK_OFF) == 0) {
-+            break;
-+        }
-+        touch_udelay(1);
-+    }
-+
-+    if (timeout == 0) {
-+        printf("SWEET TOUCH: warning: QUP0 SE0 CBCR bit 31 did not clear (0x%08x)\n", cbcr);
-+        return -1;
-+    }
-+
++    cbcr = mmio_read32(g_touch.gcc_base, GCC_QUPV3_WRAP0_S0_CBCR);
 +    printf("SWEET TOUCH: QUP0 SE0 clocks ready (VOTE=0x%08x CBCR=0x%08x)\n",
 +           mmio_read32(g_touch.gcc_base, GCC_APCS_CLOCK_BRANCH_ENA_VOTE), cbcr);
 +    return 0;
@@ -527,10 +509,10 @@ Does not touch GPIO 36 (vibrator motor on fog).
 +{
 +    /*
 +     * Configure QUP0 SE0 SPI pins (Pins 0..3):
-+     *   GPIO 0: MOSI (mux 1 qup0, 6mA/8mA drive, no pull)
-+     *   GPIO 1: MISO (mux 1 qup0, 6mA/8mA drive, no pull)
-+     *   GPIO 2: CS0  (mux 1 qup0, 6mA/8mA drive, no pull)
-+     *   GPIO 3: CLK  (mux 1 qup0, 6mA/8mA drive, no pull)
++     *   GPIO 0: MOSI (mux 1 qup0, 6mA drive, no pull)
++     *   GPIO 1: MISO (mux 1 qup0, 6mA drive, no pull)
++     *   GPIO 2: CS0  (mux 1 qup0, 6mA drive, no pull)
++     *   GPIO 3: CLK  (mux 1 qup0, 6mA drive, no pull)
 +     * Note: GPIO 36 is the ERM vibrator on Redmi 10C ("fog") and is untouched.
 +     */
 +    mmio_write32(g_touch.tlmm_base, TOUCH_GPIO_CFG(TOUCH_PIN_SPI_MOSI), TOUCH_CFG_SPI_PIN);
@@ -542,10 +524,8 @@ Does not touch GPIO 36 (vibrator motor on fog).
 +    mmio_write32(g_touch.tlmm_base, TOUCH_GPIO_CFG(TOUCH_PIN_RST), TOUCH_CFG_RST_PIN);
 +    mmio_write32(g_touch.tlmm_base, TOUCH_GPIO_IO(TOUCH_PIN_RST),  TLMM_IO_OUT_HIGH);
 +
-+    /* Configure GPIO 80 as IRQ input (active-low, internal pull-up) + edge interrupt latch */
++    /* Configure GPIO 80 as IRQ input (active-low, internal pull-up) */
 +    mmio_write32(g_touch.tlmm_base, TOUCH_GPIO_CFG(TOUCH_PIN_IRQ), TOUCH_CFG_IRQ_PIN);
-+    mmio_write32(g_touch.tlmm_base, TOUCH_GPIO_INTR_CFG(TOUCH_PIN_IRQ), (2U << 1) | 1U); /* EDGE_FALLING, INTR_EN */
-+    mmio_write32(g_touch.tlmm_base, TOUCH_GPIO_INTR_STATUS(TOUCH_PIN_IRQ), 1U);          /* Clear pending latch */
 +}
 +
 +static void
@@ -561,18 +541,9 @@ Does not touch GPIO 36 (vibrator motor on fog).
 +static inline bool
 +sweet_touch_irq_asserted(void)
 +{
-+    /* Check real-time pin level (GPIO 80 is active-low) */
++    /* GPIO 80 is active-low input: 0 = finger touching, 1 = idle */
 +    uint32_t io = mmio_read32(g_touch.tlmm_base, TOUCH_GPIO_IO(TOUCH_PIN_IRQ));
-+    if ((io & TLMM_IO_IN_BIT) == 0) {
-+        return true;
-+    }
-+    /* Check TLMM hardware edge interrupt latch (cleared by writing 1) */
-+    uint32_t stat = mmio_read32(g_touch.tlmm_base, TOUCH_GPIO_INTR_STATUS(TOUCH_PIN_IRQ));
-+    if (stat & 1U) {
-+        mmio_write32(g_touch.tlmm_base, TOUCH_GPIO_INTR_STATUS(TOUCH_PIN_IRQ), 1U);
-+        return true;
-+    }
-+    return false;
++    return (io & TLMM_IO_IN_BIT) == 0;
 +}
 +
 +/* ============================================================================
@@ -1816,6 +1787,13 @@ Does not touch GPIO 36 (vibrator motor on fog).
 +static void
 +sweet_touch_thread(void *arg __unused, wait_result_t wres __unused)
 +{
++    unsigned delay_s = 6;
++    (void)PE_parse_boot_argn("sweettouchdelay", &delay_s, sizeof(delay_s));
++    if (delay_s > 0) {
++        printf("SWEET TOUCH: waiting %u s for display & SpringBoard initialization...\n", delay_s);
++        touch_thread_sleep_ms(delay_s * 1000U);
++    }
++
 +    printf("SWEET TOUCH: thread started (fog SM6225 QUP0 SE0 SPI)\n");
 +
 +    /* Map MMIO regions */
@@ -1880,16 +1858,14 @@ Does not touch GPIO 36 (vibrator motor on fog).
 +           TOUCH_PIN_IRQ, (int)g_touch.ic_type);
 +
 +    bool had_active_touches = false;
-+    uint32_t ticks = 0;
 +
-+    /* 4. Main polling loop checking GPIO 80 (active-low IRQ or periodic check) */
++    /* 4. Main polling loop checking GPIO 80 (active-low IRQ) */
 +    for (;;) {
-+        ticks++;
 +        bool irq = sweet_touch_irq_asserted();
-+        if (irq || had_active_touches || (ticks % 3 == 0)) {
++        if (irq || had_active_touches) {
 +            if (g_touch.ic_type == TOUCH_IC_NOVATEK_NT36525B) {
 +                sweet_touch_poll_novatek();
-+            } else {
++            } else if (g_touch.ic_type == TOUCH_IC_FOCALTECH_FT5452) {
 +                sweet_touch_poll_focaltech();
 +            }
 +
@@ -1902,7 +1878,7 @@ Does not touch GPIO 36 (vibrator motor on fog).
 +            }
 +            touch_thread_sleep_ms(irq ? 4 : 8);
 +        } else {
-+            touch_thread_sleep_ms(8);
++            touch_thread_sleep_ms(10);
 +        }
 +    }
  }
