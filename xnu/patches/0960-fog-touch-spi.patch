@@ -1,21 +1,17 @@
-From 1000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: MeizIshanDev <mezan@meshan.dev>
-Date: Fri, 6 Nov 2026 01:00:00 +0530
-Subject: [PATCH] fog-0960: touch: QUP0 SE0 GENI SPI driver for Redmi 10C (fog)
+Subject: [PATCH] fog-0960: touch: stage 1 QUP0 SE0 GENI SPI bus bring-up
 
-Replace topaz I2C QUP0 SE2 FT5452 driver with QUP0 SE0 GENI SPI driver
-for Redmi 10C (SM6225/khaje). Dual-probes Novatek NT36525B and FocalTech SPI.
-Configures TLMM WEST pins 0..3 (qup0), reset GPIO 86, and IRQ GPIO 80.
-Does not touch GPIO 36 (vibrator motor on fog).
+Replace the topaz I2C driver with a bus test for the Redmi 10C Novatek IC.
+Register values come from spi-geni-qcom.c, gcc-khaje.c and nt36525b_spi in the
+fog kernel. Reads the chip ID, prints the result and stops: no polling, no
+firmware download, no touch events. GPIO 36 (vibrator) is not touched.
+
 ---
- bsd/dev/sweet_touch.c | 1400 +++++++++++++++++++++++++++++++++++++++++++++----
- 1 file changed, 1300 insertions(+), 700 deletions(-)
-
 diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
-index 370d18b..6e74c95 100644
+index 370d18b..7d9c2fb 100644
 --- a/bsd/dev/sweet_touch.c
 +++ b/bsd/dev/sweet_touch.c
-@@ -1,767 +1,842 @@
+@@ -1,11 +1,14 @@
  /*
 - * SWEET SE7 FIFO I2C / GT9896 Yellowstone / Focaltech 54:52 bring-up.
 - * topaz (SM6225): FocalTech FT5452 at 0x38 on QUP0 SE2, IRQ GPIO80, reset
@@ -24,68 +20,52 @@ index 370d18b..6e74c95 100644
 - * thread. Requires ABL-loaded GENI I2C firmware.
 - * No firmware/config upload or direct PMIC writes. Only IC data write:
 - * zero to GT9896's event status after reading a report. See touch2/report.md.
-+ * bsd/dev/sweet_touch.c
++ * fog (Redmi 10C, SM6225) touch, stage 1: prove the SPI bus to the Novatek IC.
 + *
-+ * Qualcomm SM6225 ("khaje") QUP0 SE0 GENI SPI Touchscreen Driver
-+ * for Xiaomi Redmi 10C ("fog") on Apple XNU (xnu-8796 / iOS 16).
++ * QUP0 SE0 GENI SPI, mode 0, 9.6 MHz. Reads the chip ID the way Android's
++ * nt36525b_spi driver does and prints the result, then stops. No polling, no
++ * firmware download and no touch events yet, so it cannot starve the UI.
++ * Lines contain "TOUCH": read them with sweetfb_console=1 sweetlog=TOUCH.
 + *
-+ * Supports dual-sourced SPI touch controllers on Redmi 10C:
-+ *   1. Novatek NT36525B (novatek,NVT-ts-spi)
-+ *   2. FocalTech SPI (focaltech,fts)
-+ *
-+ * Hardware Topology (Redmi 10C / fog):
-+ *   - Bus:        QUP0 SE0 GENI SPI (0x04a80000), Chip Select 0, Mode 0
-+ *   - Clocks:     GCC (0x01400000), APCS Vote (0x7900c mask 0x07c0),
-+ *                 SE0 RCG2 (CMD_RCGR 0x1f148, CFG_RCGR 0x1f14c = 1u, CBCR 0x1f144)
-+ *   - Pins:       TLMM WEST (0x00500000)
-+ *                 GPIO 0 (MOSI), GPIO 1 (MISO), GPIO 2 (CS0), GPIO 3 (CLK) -> mux 1 (qup0)
-+ *                 GPIO 86 (Reset, active-low output)
-+ *                 GPIO 80 (IRQ, active-low input with pull-up)
-+ *   - Note:       GPIO 36 is the ERM vibrator on fog and MUST NOT be driven.
-+ *   - Resolution: 720 x 1650 (@2x iOS userland -> sweet_hid_touch(finger, down, x, y))
++ * GPIO 36 is the vibrator on fog: never touch it. GPIO 80 is only read.
++ * GPIO 86 (reset) is left alone, as Android does (NVT_TOUCH_SUPPORT_HW_RST 0),
++ * unless boot-arg sweettouchrst=1.
   */
--#if defined(ARM64_BOARD_CONFIG_SWEET)
--#include <sys/param.h>
--#include <sys/systm.h>
--#include <sys/errno.h>
--#include <kern/clock.h>
-+
-+#include <stdint.h>
-+#include <stdbool.h>
-+#include <stddef.h>
-+#include <string.h>
-+
- #include <kern/thread.h>
--#include <kern/sched_prim.h>
-+#include <kern/clock.h>
-+#include <kern/debug.h>
-+#include <mach/kern_return.h>
- #include <machine/machine_routines.h>
- #include <pexpert/pexpert.h>
-+#include <sys/systm.h>
-+
-+/* ============================================================================
-+ * External iOS HID Userland Hook (iokit/Kernel/arm/hid/SweetHID.cpp)
-+ * ============================================================================ */
- 
--extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
--/* Mach MIG declaration is not included by BSD's exported thread.h. */
--extern kern_return_t thread_terminate(thread_t);
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -20,81 +23,109 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ /* Mach MIG declaration is not included by BSD's exported thread.h. */
+ extern kern_return_t thread_terminate(thread_t);
 -extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
- extern void sweet_hid_touch(int finger, int down, int x, int y);
--void sweet_touch_init(void);
--
+-extern void sweet_hid_touch(int finger, int down, int x, int y);
+ void sweet_touch_init(void);
+ 
 -#define TOUCH_SE_PA      0x04a88000u /* QUP0 SE2 */
--#define TOUCH_GCC_PA     0x01400000u
++#define TOUCH_SE_PA      0x04a80000u /* QUP0 SE0 */
++#define TOUCH_SE_SIZE    0x4000u
+ #define TOUCH_GCC_PA     0x01400000u
 -#define TOUCH_WEST_PA    0x00500000u /* TLMM 0x400000 + WEST tile: GPIO 6/7/80/86 */
 -#define TOUCH_EAST_PA    0x00d00000u /* TLMM 0x400000 + EAST tile: GPIO 36 */
 -#define TOUCH_GCC_VOTE   0x7900cu    /* QUP0 wrapper + SE2 vote, bits 0x13c0 */
 -#define TOUCH_RCG       0x1f3a8u    /* QUP0 S2 CMD; CFG +4, CBCR -4 (gcc-khaje.c) */
 -#define TOUCH_PIN_RESET  86u
--#define TOUCH_PIN_IRQ    80u
++#define TOUCH_GCC_SIZE   0x80000u
++#define TOUCH_WEST_PA    0x00500000u /* GPIO 0-3, 80, 86 (pinctrl-khaje.c) */
++#define TOUCH_WEST_SIZE  0x60000u
++
++/* gcc-khaje.c */
++#define GCC_VOTE         0x7900cu
++#define GCC_VOTE_SE0     0x07c0u     /* wrap0 m/s ahb, core, core 2x, s0 */
++#define GCC_S0_CBCR      0x1f144u
++#define GCC_S0_CMD       0x1f148u
++#define GCC_S0_CFG       0x1f14cu
++
++#define TOUCH_PIN_RST    86u
+ #define TOUCH_PIN_IRQ    80u
 -#define TOUCH_PIN_AVDD   36u
--#define TOUCH_GPIO_CFG(n) ((uint32_t)(n) * 0x1000u)
--#define TOUCH_GPIO_IO(n)  (TOUCH_GPIO_CFG(n) + 4u)
+ #define TOUCH_GPIO_CFG(n) ((uint32_t)(n) * 0x1000u)
+ #define TOUCH_GPIO_IO(n)  (TOUCH_GPIO_CFG(n) + 4u)
 -#define TOUCH_MAX        10u
 -#define TOUCH_GOODIX     1
 -#define TOUCH_FTS        2
@@ -127,8 +107,77 @@ index 370d18b..6e74c95 100644
 - * MSB-to-LSB, length 8, STOP only on vector 3. FIFO bytes remain LSB first. */
 -#define SE_PACK0        0x0007f8feu
 -#define SE_PACK1        0x000ffefeu
--
--static struct {
++
++/* qcom-geni-se.h */
++#define SE_FORCE_DEFAULT 0x020u
++#define SE_OUTPUT_CTRL   0x024u
++#define SE_CGC_CTRL      0x028u
++#define SE_STATUS        0x040u
++#define SE_MCLK          0x048u
++#define SE_FIFO_DISABLE  0x064u
++#define SE_FW            0x068u
++#define SE_CLK_SEL       0x07cu
++#define SE_BYTE_GRAN     0x254u
++#define SE_DMA_MODE      0x258u
++#define SE_TX_PACK0      0x260u
++#define SE_TX_PACK1      0x264u
++#define SE_RX_PACK0      0x284u
++#define SE_RX_PACK1      0x288u
++#define SE_CMD           0x600u
++#define SE_CTRL          0x604u
++#define SE_IRQ           0x610u
++#define SE_IRQ_EN        0x614u
++#define SE_IRQ_CLR       0x618u
++#define SE_S_IRQ_EN      0x644u
++#define SE_S_IRQ_CLR     0x648u
++#define SE_TX            0x700u
++#define SE_RX            0x780u
++#define SE_TX_COUNT      0x800u
++#define SE_RX_COUNT      0x804u
++#define SE_TX_WM         0x80cu
++#define SE_RX_WM         0x810u
++#define SE_RX_RFR_WM     0x814u
++#define SE_GSI_EVENT_EN  0xe18u
++#define SE_TOP_IRQ_EN    0xe1cu
++#define SE_HW_TX         0xe24u
++#define SE_HW_RX         0xe28u
++#define SE_DMA_CFG       0xe30u
++
++/* spi-geni-qcom.c */
++#define SPI_CPHA         0x224u
++#define SPI_LOOPBACK     0x22cu
++#define SPI_CPOL         0x230u
++#define SPI_DEMUX_INV    0x24cu
++#define SPI_DEMUX_SEL    0x250u
++#define SPI_TRANS_CFG    0x25cu
++#define SPI_WORD_LEN     0x268u
++#define SPI_TX_LEN       0x26cu
++#define SPI_RX_LEN       0x270u
++#define SPI_DELAYS       0x278u
++#define SPI_OP_TX_ONLY   1u
++#define SPI_OP_DUPLEX    3u
++#define SPI_OP_SHIFT     27
++#define SPI_PROTO        1u
++
++#define IRQ_DONE         (1u << 0)
++#define IRQ_CANCEL       (1u << 4)
++#define IRQ_ABORT        (1u << 5)
++/* se_get_packing_config(8, 1, true): one byte per FIFO word, MSB first */
++#define SPI_PACK0        0xffu
++#define SPI_PACK1        0u
++#define XFER_MAX         16u
++#define XFER_TIMEOUT_US  5000u
++
++/* nt36xxx.c and fog.dtb */
++#define NVT_ENG_RST      0x7fff80u
++#define NVT_SWRST_N8     0x3f0feu
++#define NVT_RD_FAST      0x3f310u
++#define NVT_TRIM         0x3f004u
++#define NVT_TRIM_OLD     0x1f64eu
++#define NVT_WRITE(a)     ((uint8_t)((a) | 0x80u))
++#define NVT_READ(a)      ((uint8_t)((a) & 0x7fu))
+ 
+ static struct {
 -	vm_offset_t se, gcc, west, east;
 -	bool started, dead, probing;
 -	int kind, irq_hint;
@@ -145,277 +194,52 @@ index 370d18b..6e74c95 100644
 -	unsigned s_frames, s_errs, s_down, s_up, s_maxn;
 -	int s_lasterr, s_lastx, s_lasty;
 -	uint8_t s_raw[12];
--} st;
++	vm_offset_t se, gcc, west;
++	unsigned tx_depth;
++	bool started, dead;
++	unsigned errors;
++	uint32_t fw;
++	uint32_t irq_cfg, rst_cfg, rst_io;
++	uint8_t cold[6], id[6], old_id[6];
++	int tries;
++	unsigned irq_low, irq_samples;
++	const char *verdict;
+ } st;
 +
-+/* ============================================================================
-+ * Display & Touch Geometry Constants
-+ * ============================================================================ */
-+
-+#define TOUCH_SCREEN_WIDTH          720
-+#define TOUCH_SCREEN_HEIGHT         1650
-+#define HID_VIRTUAL_WIDTH           1080
-+#define HID_VIRTUAL_HEIGHT          2400
-+#define TOUCH_MAX_FINGERS           10
-+
-+/* ============================================================================
-+ * Physical Base Addresses & Sizes (Qualcomm SM6225 / Khaje)
-+ * ============================================================================ */
-+
-+#define SM6225_TLMM_WEST_PHYS       0x00500000ULL
-+#define SM6225_TLMM_WEST_SIZE       0x00058000UL
-+
-+#define SM6225_GCC_PHYS             0x01400000ULL
-+#define SM6225_GCC_SIZE             0x00080000UL
-+
-+#define SM6225_QUP0_SE0_PHYS        0x04a80000ULL
-+#define SM6225_QUP0_SE0_SIZE        0x00004000UL
-+
-+/* ============================================================================
-+ * GCC Clock Registers (Offsets from 0x01400000) for SM6225 / Khaje
-+ * ============================================================================ */
-+
-+#define GCC_APCS_CLOCK_BRANCH_ENA_VOTE  0x7900cU
-+/* Khaje SM6225: bit 6 (M_AHB), bit 7 (S_AHB), bit 8 (WRAP0_CORE), bit 9, bit 10 (SE0) = 0x07c0 */
-+#define GCC_VOTE_QUP0_WRAP_CORE         ((1U << 6) | (1U << 7) | (1U << 8) | (1U << 9))
-+#define GCC_VOTE_QUP0_SE0               (1U << 10)  /* Bit 10: QUP0 SE0 clock */
-+#define GCC_VOTE_QUP0_SE0_MASK          (GCC_VOTE_QUP0_WRAP_CORE | GCC_VOTE_QUP0_SE0) /* 0x07c0 */
-+
-+/* Official drivers/clk/qcom/gcc-khaje.c: SE0 CBCR=0x1f144, CMD_RCGR=0x1f148, CFG_RCGR=0x1f14c */
-+#define GCC_QUPV3_WRAP0_S0_CBCR         0x1f144U    /* Branch/Halt control for SE0 */
-+#define GCC_QUPV3_WRAP0_S0_CMD_RCGR     0x1f148U    /* CMD_RCGR for SE0 */
-+#define GCC_QUPV3_WRAP0_S0_CFG_RCGR     0x1f14cU    /* CFG_RCGR for SE0 */
-+
-+#define GCC_CBCR_CLK_ENABLE             (1U << 0)
-+#define GCC_CBCR_CLK_OFF                (1U << 31)  /* Bit 31: 1 = halted, 0 = running */
-+#define GCC_CMD_RCGR_UPDATE             (1U << 0)
-+#define GCC_CFG_RCGR_SRC_XO_DIV1        1U          /* XO parent 19.2 MHz, divider 1 (2*1 - 1) */
-+
-+/* ============================================================================
-+ * TLMM Pinmux & GPIO Registers (Offsets from 0x00500000 - TLMM WEST)
-+ * ============================================================================ */
-+
-+#define TOUCH_PIN_SPI_MOSI          0U  /* GPIO 0: QUP0 SE0 SPI MOSI */
-+#define TOUCH_PIN_SPI_MISO          1U  /* GPIO 1: QUP0 SE0 SPI MISO */
-+#define TOUCH_PIN_SPI_CS0           2U  /* GPIO 2: QUP0 SE0 SPI CS0  */
-+#define TOUCH_PIN_SPI_CLK           3U  /* GPIO 3: QUP0 SE0 SPI CLK  */
-+#define TOUCH_PIN_RST               86U /* GPIO 86: Hardware Reset, active-low output */
-+#define TOUCH_PIN_IRQ               80U /* GPIO 80: Interrupt Request, active-low input */
-+
-+#define TOUCH_GPIO_CFG(pin)         ((uint32_t)(pin) * 0x1000U)
-+#define TOUCH_GPIO_IO(pin)          (TOUCH_GPIO_CFG(pin) + 4U)
-+
-+/*
-+ * Pin configurations:
-+ *   SPI pins (0..3): func=1 (qup0), drive=6mA (2<<6), pull=none (0) -> 0x0084
-+ *   RST pin (86):    func=0 (gpio), drive=6mA (2<<6), pull=none (0), dir=out (1<<9) -> 0x0280
-+ *   IRQ pin (80):    func=0 (gpio), drive=2mA (0<<6), pull=up (3), dir=in (0<<9) -> 0x0003
-+ */
-+#define TOUCH_CFG_SPI_PIN           ((1U << 2) | (2U << 6))
-+#define TOUCH_CFG_RST_PIN           ((0U << 2) | (2U << 6) | (1U << 9))
-+#define TOUCH_CFG_IRQ_PIN           ((0U << 2) | 3U)
-+
-+#define TLMM_IO_OUT_HIGH            (1U << 1)
-+#define TLMM_IO_OUT_LOW             0U
-+#define TLMM_IO_IN_BIT              1U
-+
-+/* ============================================================================
-+ * Qualcomm GENI SPI Engine Registers (Offsets from 0x04a80000 - QUP0 SE0)
-+ * ============================================================================ */
-+
-+#define GENI_FORCE_DEFAULT_REG      0x0020U
-+#define GENI_OUTPUT_CTRL            0x0024U
-+#define GENI_CGC_CTRL               0x0028U
-+#define SE_GENI_STATUS              0x0040U
-+#define GENI_SER_M_CLK_CFG          0x0048U
-+#define GENI_SER_S_CLK_CFG          0x004cU
-+#define GENI_FW_REVISION_RO         0x0068U
-+#define GENI_INIT_CFG_REVISION      0x006cU
-+#define GENI_S_IRQ_EN               0x0084U
-+#define GENI_M_IRQ_EN               0x0088U
-+#define GENI_M_IRQ_STATUS           0x008cU
-+#define GENI_M_IRQ_CLEAR            0x0090U
-+#define GENI_S_IRQ_CLEAR            0x0098U
-+#define GENI_TX_FIFOn               0x0700U
-+#define GENI_RX_FIFOn               0x0780U
-+#define GENI_TX_FIFO_STATUS         0x0800U
-+#define GENI_RX_FIFO_STATUS         0x0804U
-+#define SE_GENI_TX_PACKING_CFG0     0x0260U
-+#define SE_GENI_TX_PACKING_CFG1     0x0264U
-+#define SE_GENI_RX_PACKING_CFG0     0x0284U
-+#define SE_GENI_RX_PACKING_CFG1     0x0288U
-+#define SE_GENI_M_CMD0              0x0600U
-+#define SE_GENI_M_CMD_CTRL_REG      0x0604U
-+#define SE_GENI_TX_WATERMARK_REG    0x080cU
-+#define SE_GENI_BYTE_GRA            0x0250U
-+
-+/* SPI Specific Mode Registers */
-+#define SPI_TRANS_CFG               0x0c00U
-+#define SPI_LOOPBACK_CFG            0x0c04U
-+#define SPI_TX_WORD_LEN             0x0c1cU
-+#define SPI_RX_WORD_LEN             0x0c20U
-+#define SPI_PRE_DIVIDER             0x0c24U
-+#define SPI_DELAY_COUNTERS          0x0c30U
-+#define SPI_DEMUX_OUTPUT_INV        0x0c40U
-+#define SPI_DEMUX_SEL               0x0c44U
-+#define SPI_TRANS_CARRIER_CFG       0x0c48U
-+
-+/* GENI Command Codes */
-+#define CMD_SPI_TX_ONLY             1U
-+#define CMD_SPI_RX_ONLY             2U
-+#define CMD_SPI_FULL_DUPLEX         3U
-+
-+/* Status / IRQ bit definitions */
-+#define M_CMD_DONE_EN               (1U << 0)
-+#define M_CMD_ABORT_EN              (1U << 5)
-+#define M_CMD_DONE_BIT              (1U << 0)
-+#define M_TX_FIFO_NOT_EMPTY         (1U << 1)
-+#define M_RX_FIFO_NOT_EMPTY         (1U << 4)
-+#define M_GENI_CMD_ACTIVE           (1U << 0)
-+
-+/* ============================================================================
-+ * Novatek NT36525B SPI Protocol Constants
-+ * ============================================================================ */
-+
-+#define NVT_EVENT_BUF_ADDR_DEFAULT  0x3f310U    /* From fog.dtb novatek,spi-rd-fast-addr */
-+#define NVT_SWRST_ADDR_DEFAULT      0x3f0feU    /* From fog.dtb novatek,swrst-n8-addr */
-+#define NVT_CMD_READ_FAST           0x3f310U
-+#define NVT_TOUCH_PACKET_LEN        65U
-+
-+/* ============================================================================
-+ * FocalTech SPI Protocol Constants
-+ * ============================================================================ */
-+
-+#define FTS_REG_CHIP_ID             0xa3U
-+#define FTS_REG_FLOW_WORK_MD        0x00U
-+#define FTS_REG_POINT_RATE          0x88U
-+#define FTS_REG_FW_VER              0xa6U
-+#define FTS_REG_VENDOR_ID           0xa8U
-+#define FTS_PACKET_LENGTH           64U
-+
-+#define FTS_CHIP_ID_FT5452          0x54U
-+#define FTS_CHIP_ID_FT8719          0x87U
-+#define FTS_CHIP_ID_FT8006          0x80U
-+
-+#define FTS_TOUCH_DOWN              0x00U
-+#define FTS_TOUCH_UP                0x01U
-+#define FTS_TOUCH_CONTACT           0x02U
-+
-+/* ============================================================================
-+ * Driver Runtime Context
-+ * ============================================================================ */
-+
-+enum touch_ic_type {
-+    TOUCH_IC_NONE = 0,
-+    TOUCH_IC_NOVATEK_NT36525B = 1,
-+    TOUCH_IC_FOCALTECH_FT5452 = 2
-+};
-+
-+struct sweet_touch_state {
-+    volatile uintptr_t tlmm_base;
-+    volatile uintptr_t gcc_base;
-+    volatile uintptr_t spi_base;
-+
-+    enum touch_ic_type ic_type;
-+    uint32_t nvt_event_buf_addr;
-+
-+    int      abs_x_max;
-+    int      abs_y_max;
-+
-+    bool     finger_down[TOUCH_MAX_FINGERS];
-+    int      last_x[TOUCH_MAX_FINGERS];
-+    int      last_y[TOUCH_MAX_FINGERS];
-+};
-+
-+static struct sweet_touch_state g_touch;
-+static int g_touch_started = 0;
  static int touch_sleep_chan;
  
--static uint32_t
--touch_rd(vm_offset_t base, uint32_t off)
-+/* ============================================================================
-+ * Memory Mapped I/O Helper Functions
-+ * ============================================================================ */
-+
-+static inline void
-+mmio_write32(uintptr_t base, uint32_t offset, uint32_t val)
- {
--	uint32_t v = *(volatile uint32_t *)(base + off);
--	__asm__ volatile("dmb oshld" ::: "memory");
--	return v;
-+    __asm__ volatile("dmb oshst" ::: "memory");
-+    *(volatile uint32_t *)(base + offset) = val;
-+    __asm__ volatile("dsb osh" ::: "memory");
- }
- 
--static void
--touch_wr(vm_offset_t base, uint32_t off, uint32_t val)
-+static inline uint32_t
-+mmio_read32(uintptr_t base, uint32_t offset)
- {
--	__asm__ volatile("dmb oshst" ::: "memory");
--	*(volatile uint32_t *)(base + off) = val;
--	__asm__ volatile("dsb osh" ::: "memory");
-+    __asm__ volatile("dsb osh" ::: "memory");
-+    uint32_t val = *(volatile uint32_t *)(base + offset);
-+    __asm__ volatile("dmb oshld" ::: "memory");
-+    return val;
- }
- 
--static void
--touch_wait(unsigned ms)
-+static inline void
-+touch_udelay(uint32_t us)
- {
--	uint64_t deadline;
--	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
--	(void)assert_wait_deadline(&touch_sleep_chan, THREAD_UNINT, deadline);
--	thread_block(THREAD_CONTINUE_NULL);
-+    if (us == 0) {
-+        return;
-+    }
-+    delay(us);
- }
- 
--static bool
--touch_wait_clear(vm_offset_t base, uint32_t off, uint32_t mask)
-+static inline void
-+touch_msleep(uint32_t ms)
- {
--	for (unsigned i = 0; i < 5000; ++i) {
--		if (!(touch_rd(base, off) & mask)) {
--			return true;
--		}
--		delay(1);
--	}
--	return false;
-+    if (ms == 0) {
-+        return;
-+    }
-+    delay(ms * 1000U);
+ static uint32_t
+@@ -134,608 +165,313 @@ touch_wait_clear(vm_offset_t base, uint32_t off, uint32_t mask)
+ 	return false;
  }
  
 -/* topaz: GPIO 36 is on the EAST tile, the touch pins otherwise on WEST. */
 -static vm_offset_t
 -touch_tile(unsigned pin)
-+/* Sleep on kernel scheduler wait queue during polling loop */
-+static void
-+touch_thread_sleep_ms(uint32_t ms)
++static bool
++touch_clocks(void)
  {
 -	return pin == TOUCH_PIN_AVDD ? st.east : st.west;
-+    uint64_t deadline = 0;
-+    clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
-+    (void)assert_wait_deadline(&touch_sleep_chan, THREAD_UNINT, deadline);
-+    thread_block(THREAD_CONTINUE_NULL);
++	/* Shared vote register: only OR our bits in. XO parent, divider 1 = 19.2 MHz. */
++	touch_wr(st.gcc, GCC_VOTE, touch_rd(st.gcc, GCC_VOTE) | GCC_VOTE_SE0);
++	touch_wr(st.gcc, GCC_S0_CFG, 1u);
++	touch_wr(st.gcc, GCC_S0_CMD, touch_rd(st.gcc, GCC_S0_CMD) | 1u);
++	if (!touch_wait_clear(st.gcc, GCC_S0_CMD, 1u)) {
++		printf("SWEET TOUCH: RCG update timeout cmd=%#x\n", touch_rd(st.gcc, GCC_S0_CMD));
++		return false;
++	}
++	if (!touch_wait_clear(st.gcc, GCC_S0_CBCR, 1u << 31)) {
++		printf("SWEET TOUCH: SE0 branch halted cbcr=%#x\n", touch_rd(st.gcc, GCC_S0_CBCR));
++		return false;
++	}
++	printf("SWEET TOUCH: clocks ok vote=%#x cfg=%#x cbcr=%#x\n", touch_rd(st.gcc, GCC_VOTE),
++	    touch_rd(st.gcc, GCC_S0_CFG), touch_rd(st.gcc, GCC_S0_CBCR));
++	return true;
  }
  
--static void
+ static void
 -touch_gpio(unsigned pin, unsigned mux, unsigned pull, unsigned drive, bool out, bool high)
-+/* ============================================================================
-+ * 1. Clock & Pin Control Initialization
-+ * ============================================================================ */
-+
-+static int
-+sweet_touch_clocks_init(void)
++touch_pins(void)
  {
 -	vm_offset_t tile = touch_tile(pin);
 -	uint32_t off = TOUCH_GPIO_CFG(pin);
@@ -428,47 +252,19 @@ index 370d18b..6e74c95 100644
 -	cfg &= ~0x3ffu;
 -	cfg |= (mux << 2) | pull | (drive << 6) | (out ? 0x200u : 0u);
 -	touch_wr(tile, off, cfg);
-+    uint32_t vote;
-+    uint32_t cmd;
-+    uint32_t cbcr;
-+    int timeout;
-+
-+    /* 1. Vote on QUP0 Wrapper + SE0 via non-secure APCS vote register (0x7900c) */
-+    vote = mmio_read32(g_touch.gcc_base, GCC_APCS_CLOCK_BRANCH_ENA_VOTE);
-+    vote |= GCC_VOTE_QUP0_SE0_MASK;
-+    mmio_write32(g_touch.gcc_base, GCC_APCS_CLOCK_BRANCH_ENA_VOTE, vote);
-+    (void)mmio_read32(g_touch.gcc_base, GCC_APCS_CLOCK_BRANCH_ENA_VOTE);
-+
-+    /* 2. Configure RCG2 for QUP0 SE0: XO parent (19.2 MHz), divider 1 */
-+    mmio_write32(g_touch.gcc_base, GCC_QUPV3_WRAP0_S0_CFG_RCGR, GCC_CFG_RCGR_SRC_XO_DIV1);
-+
-+    cmd = mmio_read32(g_touch.gcc_base, GCC_QUPV3_WRAP0_S0_CMD_RCGR);
-+    cmd |= GCC_CMD_RCGR_UPDATE;
-+    mmio_write32(g_touch.gcc_base, GCC_QUPV3_WRAP0_S0_CMD_RCGR, cmd);
-+
-+    for (timeout = 2000; timeout > 0; timeout--) {
-+        if ((mmio_read32(g_touch.gcc_base, GCC_QUPV3_WRAP0_S0_CMD_RCGR) & GCC_CMD_RCGR_UPDATE) == 0) {
-+            break;
-+        }
-+        touch_udelay(1);
-+    }
-+
-+    /* 3. Ensure Branch Clock is enabled */
-+    cbcr = mmio_read32(g_touch.gcc_base, GCC_QUPV3_WRAP0_S0_CBCR);
-+    if ((cbcr & GCC_CBCR_CLK_ENABLE) == 0) {
-+        mmio_write32(g_touch.gcc_base, GCC_QUPV3_WRAP0_S0_CBCR, cbcr | GCC_CBCR_CLK_ENABLE);
-+    }
-+
-+    cbcr = mmio_read32(g_touch.gcc_base, GCC_QUPV3_WRAP0_S0_CBCR);
-+    printf("SWEET TOUCH: QUP0 SE0 clocks ready (VOTE=0x%08x CBCR=0x%08x)\n",
-+           mmio_read32(g_touch.gcc_base, GCC_APCS_CLOCK_BRANCH_ENA_VOTE), cbcr);
-+    return 0;
++	/* bengal-pinctrl.dtsi qupv3_se0_spi_active: function qup0, 6 mA, no pull */
++	for (unsigned pin = 0; pin < 4; ++pin) {
++		uint32_t cfg = touch_rd(st.west, TOUCH_GPIO_CFG(pin)) & ~0x3ffu;
++		touch_wr(st.west, TOUCH_GPIO_CFG(pin), cfg | (1u << 2) | (2u << 6));
++	}
++	st.irq_cfg = touch_rd(st.west, TOUCH_GPIO_CFG(TOUCH_PIN_IRQ));
++	st.rst_cfg = touch_rd(st.west, TOUCH_GPIO_CFG(TOUCH_PIN_RST));
++	st.rst_io = touch_rd(st.west, TOUCH_GPIO_IO(TOUCH_PIN_RST));
  }
  
--static bool
+ static bool
 -touch_clocks(void)
-+static void
-+sweet_touch_pins_init(void)
++touch_se_init(void)
  {
 -	/*
 -	 * topaz (TopazTouch hwio.c): OR the QUP0 wrapper/SE2 votes into the
@@ -484,114 +280,146 @@ index 370d18b..6e74c95 100644
 -	touch_wr(st.gcc, TOUCH_RCG, touch_rd(st.gcc, TOUCH_RCG) | 1u);
 -	if (!touch_wait_clear(st.gcc, TOUCH_RCG, 1u)) {
 -		printf("SWEET TOUCH: RCG update timeout\n");
--		return false;
--	}
++	uint32_t tx = touch_rd(st.se, SE_HW_TX), rx = touch_rd(st.se, SE_HW_RX);
++	uint32_t rx_depth = (rx >> 16) & 0x3fu;
++
++	st.fw = touch_rd(st.se, SE_FW);
++	st.tx_depth = (tx >> 16) & 0x3fu;
++	printf("SWEET TOUCH: se0 fw=%#x proto=%u status=%#x tx=%#x rx=%#x fifo_off=%#x\n",
++	    st.fw, (st.fw >> 8) & 0xffu, touch_rd(st.se, SE_STATUS), tx, rx,
++	    touch_rd(st.se, SE_FIFO_DISABLE));
++	if (((st.fw >> 8) & 0xffu) != SPI_PROTO) {
++		printf("SWEET TOUCH: SE0 is not running SPI firmware; stopping\n");
++		return false;
++	}
++	if ((touch_rd(st.se, SE_FIFO_DISABLE) & 1u) || st.tx_depth < 2u || rx_depth < 2u) {
++		printf("SWEET TOUCH: SE0 FIFO mode unavailable; stopping\n");
++		return false;
++	}
++	if (touch_rd(st.se, SE_STATUS) & 0x1001u) {
++		printf("SWEET TOUCH: SE0 already busy; stopping\n");
+ 		return false;
+ 	}
 -	st.d_cfg = touch_rd(st.gcc, TOUCH_RCG + 4u);
 -	st.d_cbcr = touch_rd(st.gcc, TOUCH_RCG - 4u);
 -	if (!touch_wait_clear(st.gcc, TOUCH_RCG - 4u, 1u << 31)) {
 -		printf("SWEET TOUCH: SE2 branch halted (%#x)\n", touch_rd(st.gcc, TOUCH_RCG - 4u));
--		return false;
--	}
--	return true;
-+    /*
-+     * Configure QUP0 SE0 SPI pins (Pins 0..3):
-+     *   GPIO 0: MOSI (mux 1 qup0, 6mA drive, no pull)
-+     *   GPIO 1: MISO (mux 1 qup0, 6mA drive, no pull)
-+     *   GPIO 2: CS0  (mux 1 qup0, 6mA drive, no pull)
-+     *   GPIO 3: CLK  (mux 1 qup0, 6mA drive, no pull)
-+     * Note: GPIO 36 is the ERM vibrator on Redmi 10C ("fog") and is untouched.
-+     */
-+    mmio_write32(g_touch.tlmm_base, TOUCH_GPIO_CFG(TOUCH_PIN_SPI_MOSI), TOUCH_CFG_SPI_PIN);
-+    mmio_write32(g_touch.tlmm_base, TOUCH_GPIO_CFG(TOUCH_PIN_SPI_MISO), TOUCH_CFG_SPI_PIN);
-+    mmio_write32(g_touch.tlmm_base, TOUCH_GPIO_CFG(TOUCH_PIN_SPI_CS0),  TOUCH_CFG_SPI_PIN);
-+    mmio_write32(g_touch.tlmm_base, TOUCH_GPIO_CFG(TOUCH_PIN_SPI_CLK),  TOUCH_CFG_SPI_PIN);
-+
-+    /* Configure GPIO 86 as Reset output (initially high) */
-+    mmio_write32(g_touch.tlmm_base, TOUCH_GPIO_CFG(TOUCH_PIN_RST), TOUCH_CFG_RST_PIN);
-+    mmio_write32(g_touch.tlmm_base, TOUCH_GPIO_IO(TOUCH_PIN_RST),  TLMM_IO_OUT_HIGH);
-+
-+    /* Configure GPIO 80 as IRQ input (active-low, internal pull-up) */
-+    mmio_write32(g_touch.tlmm_base, TOUCH_GPIO_CFG(TOUCH_PIN_IRQ), TOUCH_CFG_IRQ_PIN);
++	touch_wr(st.se, SE_GSI_EVENT_EN, 0);
++	touch_wr(st.se, SE_TOP_IRQ_EN, 0);   /* no external IRQ: status is polled */
++	touch_wr(st.se, SE_S_IRQ_EN, 0);
++	touch_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
++	touch_wr(st.se, SE_S_IRQ_CLR, 0xffffffffu);
++	touch_wr(st.se, SE_DMA_MODE, 0);
++	touch_wr(st.se, SE_CGC_CTRL, touch_rd(st.se, SE_CGC_CTRL) | 0x7fu);
++	touch_wr(st.se, SE_DMA_CFG, touch_rd(st.se, SE_DMA_CFG) | 0x0fu);
++	touch_wr(st.se, SE_OUTPUT_CTRL, 0x7fu);
++	touch_wr(st.se, SE_FORCE_DEFAULT, 1u);
++	touch_wr(st.se, SE_CLK_SEL, 0);
++	touch_wr(st.se, SE_MCLK, (2u << 4) | 1u); /* 19.2 / 2 = 9.6 MHz, fog.dtb max */
++	touch_wr(st.se, SPI_LOOPBACK, 0);
++	touch_wr(st.se, SPI_DEMUX_SEL, 0);        /* CS0 */
++	touch_wr(st.se, SPI_CPHA, 0);
++	touch_wr(st.se, SPI_CPOL, 0);
++	touch_wr(st.se, SPI_DEMUX_INV, 0);
++	touch_wr(st.se, SPI_DELAYS, 0);
++	touch_wr(st.se, SPI_WORD_LEN, 8u - 4u);   /* field is bits - MIN_WORD_LEN */
++	touch_wr(st.se, SPI_TRANS_CFG, touch_rd(st.se, SPI_TRANS_CFG) & ~1u); /* no CS toggle */
++	touch_wr(st.se, SE_BYTE_GRAN, 0);
++	touch_wr(st.se, SE_TX_PACK0, SPI_PACK0);
++	touch_wr(st.se, SE_TX_PACK1, SPI_PACK1);
++	touch_wr(st.se, SE_RX_PACK0, SPI_PACK0);
++	touch_wr(st.se, SE_RX_PACK1, SPI_PACK1);
++	touch_wr(st.se, SE_TX_WM, 0);
++	touch_wr(st.se, SE_RX_WM, 0);
++	touch_wr(st.se, SE_RX_RFR_WM, rx_depth - 2u);
++	touch_wr(st.se, SE_IRQ_EN, IRQ_DONE | IRQ_CANCEL | IRQ_ABORT);
++	if (touch_rd(st.se, SE_TX_PACK0) != SPI_PACK0 || touch_rd(st.se, SE_RX_PACK0) != SPI_PACK0) {
++		printf("SWEET TOUCH: packing readback mismatch; stopping\n");
++		return false;
++	}
++	if ((touch_rd(st.se, SE_TX_COUNT) & 0xfffffffu) || (touch_rd(st.se, SE_RX_COUNT) & 0x1ffffffu)) {
++		printf("SWEET TOUCH: inherited FIFO data; stopping\n");
+ 		return false;
+ 	}
+ 	return true;
  }
  
 -/* Called only for a transfer started by this driver, including a stretched TX. */
  static void
--touch_abort(void)
-+sweet_touch_hw_reset(void)
+ touch_abort(void)
  {
 -	/* i2c-qcom-geni.c: M_GENI_CMD_CANCEL, then ABORT if cancel does not finish */
--	bool done = false;
--	touch_wr(st.se, SE_CTRL, 4);
+ 	bool done = false;
++
+ 	touch_wr(st.se, SE_CTRL, 4);
 -	for (unsigned i = 0; i < 1000; ++i) {
 -		if (touch_rd(st.se, SE_IRQ) & (1u << 4)) {
 -			done = true;
 -			break;
 -		}
--		delay(1);
--	}
--	if (!done) {
++	for (unsigned i = 0; i < 1000 && !done; ++i) {
++		done = (touch_rd(st.se, SE_IRQ) & IRQ_CANCEL) != 0;
+ 		delay(1);
+ 	}
+ 	if (!done) {
 -		touch_wr(st.se, SE_CTRL, 2); /* abort M command, release held bus */
 -		for (unsigned i = 0; i < 1000; ++i) {
 -			if (touch_rd(st.se, SE_IRQ) & (1u << 5)) {
 -				done = true;
 -				break;
 -			}
--			delay(1);
--		}
--	}
--	if (!done || !touch_wait_clear(st.se, SE_STATUS, 1u)) {
--		st.dead = true;
++		touch_wr(st.se, SE_CTRL, 2);
++		for (unsigned i = 0; i < 1000 && !done; ++i) {
++			done = (touch_rd(st.se, SE_IRQ) & IRQ_ABORT) != 0;
+ 			delay(1);
+ 		}
+ 	}
+ 	if (!done || !touch_wait_clear(st.se, SE_STATUS, 1u)) {
+ 		st.dead = true;
 -		printf("SWEET TOUCH: abort failed status=%#x irq=%#x; stopping\n",
--		    touch_rd(st.se, SE_STATUS), touch_rd(st.se, SE_IRQ));
--	}
++		printf("SWEET TOUCH: abort failed status=%#x irq=%#x\n",
+ 		    touch_rd(st.se, SE_STATUS), touch_rd(st.se, SE_IRQ));
+ 	}
 -	/* Bound drain even if the hardware reports an impossible FIFO count. */
--	for (unsigned i = 0; i < 64 && (touch_rd(st.se, SE_RX_COUNT) & 0x1ffffffu); ++i) {
--		(void)touch_rd(st.se, SE_RX);
--	}
--	touch_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
+ 	for (unsigned i = 0; i < 64 && (touch_rd(st.se, SE_RX_COUNT) & 0x1ffffffu); ++i) {
+ 		(void)touch_rd(st.se, SE_RX);
+ 	}
+ 	touch_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
 -	if (touch_rd(st.se, SE_TX_COUNT) & 0xfffffffu) {
 -		st.dead = true;
 -		printf("SWEET TOUCH: TX FIFO not empty after abort; stopping\n");
 -	}
-+    /* Novatek / FocalTech reset sequence: 20 ms low, 250 ms high */
-+    mmio_write32(g_touch.tlmm_base, TOUCH_GPIO_IO(TOUCH_PIN_RST), TLMM_IO_OUT_LOW);
-+    touch_msleep(20);
-+    mmio_write32(g_touch.tlmm_base, TOUCH_GPIO_IO(TOUCH_PIN_RST), TLMM_IO_OUT_HIGH);
-+    touch_msleep(250);
  }
  
 -/* Keep all observed bits for diagnostics, even if a watermark was cleared. */
 -static uint32_t
 -touch_irq(void)
-+static inline bool
-+sweet_touch_irq_asserted(void)
++/* One CS-low transfer. rx == NULL: write only; otherwise full duplex. */
++static bool
++touch_xfer(const uint8_t *tx, uint8_t *rx, uint32_t len)
  {
 -	st.irq_last = touch_rd(st.se, SE_IRQ);
 -	st.irq_status |= st.irq_last;
 -	return st.irq_last;
-+    /* GPIO 80 is active-low input: 0 = finger touching, 1 = idle */
-+    uint32_t io = mmio_read32(g_touch.tlmm_base, TOUCH_GPIO_IO(TOUCH_PIN_IRQ));
-+    return (io & TLMM_IO_IN_BIT) == 0;
- }
+-}
++	uint32_t txi = 0, rxi = 0;
  
 -/* One Linux-style FIFO message. TX is at most 3 bytes; RX at most 90. */
-+/* ============================================================================
-+ * 2. Qualcomm GENI SPI Controller Low-Level Engine
-+ * ============================================================================ */
-+
- static int
+-static int
 -touch_msg_run(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
 -    unsigned nr, bool stretch)
-+geni_spi_wait_for_bit(uint32_t reg_offset, uint32_t bit_mask, bool set, uint32_t timeout_us)
- {
+-{
 -	if (st.dead || nt > 3 || nr > 90 || (nt && nr) || (!nt && !nr)) {
 -		return EIO;
 -	}
 -	if (!touch_wait_clear(st.se, SE_STATUS, 1u)) {
 -		st.dead = true; /* no other SE7 owner is supported */
 -		return EBUSY;
--	}
--	touch_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
++	if (st.dead || len == 0 || len > XFER_MAX || (touch_rd(st.se, SE_STATUS) & 1u)) {
++		st.errors++;
++		return false;
+ 	}
+ 	touch_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
 -	touch_wr(st.se, SE_TX_WM, nt ? 1u : 0u);
 -	touch_wr(st.se, nr ? SE_RX_LEN : SE_TX_LEN, nr ? nr : nt);
 -	touch_wr(st.se, SE_CMD, ((nr ? 2u : 1u) << 27) |
@@ -632,13 +460,23 @@ index 370d18b..6e74c95 100644
 -		if (count > 64 || count > (nr - st.got + 3u) / 4u) {
 -			err = EIO;
 -			break;
--		}
++	touch_wr(st.se, SPI_TX_LEN, len);
++	touch_wr(st.se, SPI_RX_LEN, rx ? len : 0);
++	touch_wr(st.se, SE_CMD, (rx ? SPI_OP_DUPLEX : SPI_OP_TX_ONLY) << SPI_OP_SHIFT);
++
++	for (uint32_t us = 0; us < XFER_TIMEOUT_US; ++us) {
++		while (txi < len && (touch_rd(st.se, SE_TX_COUNT) & 0xfffffffu) < st.tx_depth - 1u) {
++			touch_wr(st.se, SE_TX, tx[txi++]);
+ 		}
 -		while (count--) {
 -			uint32_t word = touch_rd(st.se, SE_RX);
 -			for (unsigned j = 0; j < 4 && st.got < nr; ++j) {
 -				rx[st.got++] = (uint8_t)(word >> (8u * j));
--			}
--		}
++		if (rx) {
++			while (rxi < len && (touch_rd(st.se, SE_RX_COUNT) & 0x1ffffffu)) {
++				rx[rxi++] = (uint8_t)touch_rd(st.se, SE_RX);
+ 			}
+ 		}
 -		/* DONE is checked after draining RX, so final short words aren't lost. */
 -		if (irq & SE_DONE) {
 -			/* Re-sample after the final drain; a late error must beat DONE. */
@@ -652,28 +490,27 @@ index 370d18b..6e74c95 100644
 -			}
 -			err = EIO;
 -			break;
--		}
++		if ((touch_rd(st.se, SE_IRQ) & IRQ_DONE) && txi == len && (!rx || rxi == len)) {
++			touch_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
++			return true;
+ 		}
 -		/* Preserve DONE/errors if they arrive during this iteration. */
 -		touch_wr(st.se, SE_IRQ_CLR, irq & (SE_RX_WM_IRQ | SE_RX_LAST | SE_TX_WM_IRQ));
--		delay(1);
--	}
--	touch_abort();
+ 		delay(1);
+ 	}
++	printf("SWEET TOUCH: xfer timeout len=%u tx=%u rx=%u irq=%#x status=%#x\n", len, txi, rxi,
++	    touch_rd(st.se, SE_IRQ), touch_rd(st.se, SE_STATUS));
++	st.errors++;
+ 	touch_abort();
 -	return err;
-+    while (timeout_us > 0) {
-+        uint32_t val = mmio_read32(g_touch.spi_base, reg_offset);
-+        if (set ? ((val & bit_mask) != 0) : ((val & bit_mask) == 0)) {
-+            return 0;
-+        }
-+        touch_udelay(5);
-+        timeout_us = (timeout_us > 5) ? (timeout_us - 5) : 0;
-+    }
-+    return -1;
++	return false;
  }
  
- static int
+-static int
 -touch_msg(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
 -    unsigned nr, bool stretch)
-+geni_spi_init(void)
++static bool
++nvt_set_page(uint32_t addr)
  {
 -	st.irq_status = st.irq_last = 0;
 -	st.sent = st.got = 0;
@@ -685,56 +522,14 @@ index 370d18b..6e74c95 100644
 -		    touch_rd(st.se, SE_STATUS));
 -	}
 -	return err;
-+    /* Verify hardware presence */
-+    uint32_t fw_ver = mmio_read32(g_touch.spi_base, GENI_FW_REVISION_RO);
-+    if ((fw_ver & 0xffff0000U) == 0) {
-+        printf("SWEET TOUCH: invalid GENI SPI revision (0x%08x)\n", fw_ver);
-+        return -1;
-+    }
-+
-+    /* Force default states */
-+    mmio_write32(g_touch.spi_base, GENI_FORCE_DEFAULT_REG, 1U);
-+    mmio_write32(g_touch.spi_base, GENI_OUTPUT_CTRL, 0x7fU);
-+    mmio_write32(g_touch.spi_base, GENI_CGC_CTRL, 0x7fU);
-+
-+    /* Clock configuration: Serial clock divider (19.2 MHz / 2 = 9.6 MHz SPI CLK) */
-+    mmio_write32(g_touch.spi_base, GENI_SER_M_CLK_CFG, (1U << 4) | 1U);
-+    mmio_write32(g_touch.spi_base, GENI_SER_S_CLK_CFG, (1U << 4) | 1U);
-+
-+    /*
-+     * Configure Mode 0 (CPOL=0, CPHA=0), MSB First, 8-bit words:
-+     *   TRANS_CFG: bit 0 (CPOL=0), bit 1 (CPHA=0)
-+     *   TX/RX Word Len: 8 bits
-+     *   Pre-divider: 2
-+     */
-+    mmio_write32(g_touch.spi_base, SPI_TRANS_CFG, 0U);
-+    mmio_write32(g_touch.spi_base, SPI_TX_WORD_LEN, 8U);
-+    mmio_write32(g_touch.spi_base, SPI_RX_WORD_LEN, 8U);
-+    mmio_write32(g_touch.spi_base, SPI_PRE_DIVIDER, 2U);
-+    mmio_write32(g_touch.spi_base, SPI_LOOPBACK_CFG, 0U);
-+    mmio_write32(g_touch.spi_base, SPI_DEMUX_OUTPUT_INV, 0U);
-+    mmio_write32(g_touch.spi_base, SPI_DEMUX_SEL, 0U);  /* CS0 */
-+
-+    /* 8-bit word packing configurations (1 byte per FIFO word) */
-+    mmio_write32(g_touch.spi_base, SE_GENI_BYTE_GRA, 1U);
-+    mmio_write32(g_touch.spi_base, SE_GENI_TX_PACKING_CFG0, 0x00000008U);
-+    mmio_write32(g_touch.spi_base, SE_GENI_TX_PACKING_CFG1, 0x00000000U);
-+    mmio_write32(g_touch.spi_base, SE_GENI_RX_PACKING_CFG0, 0x00000008U);
-+    mmio_write32(g_touch.spi_base, SE_GENI_RX_PACKING_CFG1, 0x00000000U);
-+
-+    /* Clear and disable interrupts for synchronous FIFO polling */
-+    mmio_write32(g_touch.spi_base, GENI_M_IRQ_CLEAR, 0xffffffffU);
-+    mmio_write32(g_touch.spi_base, GENI_S_IRQ_CLEAR, 0xffffffffU);
-+    mmio_write32(g_touch.spi_base, GENI_M_IRQ_EN, 0U);
-+    mmio_write32(g_touch.spi_base, GENI_S_IRQ_EN, 0U);
-+
-+    printf("SWEET TOUCH: GENI SPI master initialized (FW rev 0x%08x)\n", fw_ver);
-+    return 0;
++	const uint8_t tx[3] = { 0xff, (uint8_t)(addr >> 15), (uint8_t)(addr >> 7) };
++	return touch_xfer(tx, NULL, sizeof(tx));
  }
  
- static int
+-static int
 -touch_read(uint8_t addr, uint16_t reg, bool wide, uint8_t *buf, unsigned len)
-+geni_spi_transfer_sync(const uint8_t *tx_buf, uint32_t tx_len, uint8_t *rx_buf, uint32_t rx_len)
++static bool
++nvt_write(uint32_t addr, uint8_t val)
  {
 -	uint8_t ptr[2] = {(uint8_t)(reg >> 8), (uint8_t)reg};
 -	int err = touch_msg(addr, wide ? ptr : ptr + 1, wide ? 2u : 1u,
@@ -744,144 +539,28 @@ index 370d18b..6e74c95 100644
 -	}
 -	/* STOP_STRETCH on the pointer write retains the bus for a repeated START. */
 -	return touch_msg(addr, NULL, 0, buf, len, false);
-+    if (tx_len == 0 && rx_len == 0) {
-+        return 0;
-+    }
-+
-+    /* Wait for controller to be idle */
-+    if (geni_spi_wait_for_bit(SE_GENI_STATUS, M_GENI_CMD_ACTIVE, false, 5000) != 0) {
-+        mmio_write32(g_touch.spi_base, SE_GENI_M_CMD_CTRL_REG, 2U); /* M_ABORT */
-+        (void)geni_spi_wait_for_bit(SE_GENI_STATUS, M_GENI_CMD_ACTIVE, false, 5000);
-+        return -1;
-+    }
-+
-+    mmio_write32(g_touch.spi_base, GENI_M_IRQ_CLEAR, 0xffffffffU);
-+
-+    uint32_t cmd = 0;
-+    uint32_t total_trans = (tx_len > rx_len) ? tx_len : rx_len;
-+
-+    if (tx_len > 0 && rx_len > 0) {
-+        cmd = (CMD_SPI_FULL_DUPLEX << 27) | (total_trans & 0xffffffU);
-+    } else if (tx_len > 0) {
-+        cmd = (CMD_SPI_TX_ONLY << 27) | (tx_len & 0xffffffU);
-+    } else {
-+        cmd = (CMD_SPI_RX_ONLY << 27) | (rx_len & 0xffffffU);
-+    }
-+
-+    /* Issue GENI command */
-+    mmio_write32(g_touch.spi_base, SE_GENI_M_CMD0, cmd);
-+
-+    uint32_t tx_idx = 0;
-+    uint32_t rx_idx = 0;
-+    uint32_t timeout_us = 25000;
-+
-+    while (timeout_us > 0) {
-+        /* Write TX bytes */
-+        if (tx_idx < total_trans) {
-+            uint32_t tx_status = mmio_read32(g_touch.spi_base, GENI_TX_FIFO_STATUS);
-+            uint32_t tx_fifo_cnt = (tx_status & 0xffU);
-+            if (tx_fifo_cnt < 16) {
-+                uint32_t b = (tx_idx < tx_len) ? (uint32_t)tx_buf[tx_idx] : 0xffU;
-+                mmio_write32(g_touch.spi_base, GENI_TX_FIFOn, b);
-+                tx_idx++;
-+            }
-+        }
-+
-+        /* Read RX bytes */
-+        uint32_t rx_status = mmio_read32(g_touch.spi_base, GENI_RX_FIFO_STATUS);
-+        uint32_t rx_fifo_cnt = (rx_status & 0xffU);
-+        while (rx_fifo_cnt > 0) {
-+            uint32_t b = mmio_read32(g_touch.spi_base, GENI_RX_FIFOn) & 0xffU;
-+            if (rx_idx < rx_len && rx_buf != NULL) {
-+                rx_buf[rx_idx] = (uint8_t)b;
-+            }
-+            rx_idx++;
-+            rx_fifo_cnt--;
-+        }
-+
-+        /* Check for completion */
-+        uint32_t irq_status = mmio_read32(g_touch.spi_base, GENI_M_IRQ_STATUS);
-+        if ((irq_status & M_CMD_DONE_BIT) != 0 && (rx_idx >= rx_len)) {
-+            mmio_write32(g_touch.spi_base, GENI_M_IRQ_CLEAR, M_CMD_DONE_BIT);
-+            return 0;
-+        }
-+
-+        touch_udelay(5);
-+        timeout_us = (timeout_us > 5) ? (timeout_us - 5) : 0;
-+    }
-+
-+    /* Transfer timed out: abort command */
-+    mmio_write32(g_touch.spi_base, SE_GENI_M_CMD_CTRL_REG, 2U); /* M_ABORT */
-+    mmio_write32(g_touch.spi_base, GENI_M_IRQ_CLEAR, 0xffffffffU);
-+    return -1;
-+}
-+
-+/* ============================================================================
-+ * 3. Novatek NT36525B SPI Protocol Engine
-+ * ============================================================================ */
-+
-+static int
-+nvt_set_page(uint32_t addr)
-+{
-+    uint8_t tx[4];
-+    tx[0] = 0xff;               /* Novatek SPI prefix / page select */
-+    tx[1] = (uint8_t)((addr >> 16) & 0x7f);
-+    tx[2] = (uint8_t)((addr >> 8) & 0xff);
-+    tx[3] = (uint8_t)(addr & 0xff);
-+    return geni_spi_transfer_sync(tx, 4, NULL, 0);
++	const uint8_t tx[2] = { NVT_WRITE(addr), val };
++	return nvt_set_page(addr) && touch_xfer(tx, NULL, sizeof(tx));
  }
  
- static int
+-static int
 -touch_goodix_ack(void)
-+nvt_read_packet(uint32_t addr, uint8_t *buf, uint32_t len)
-+{
-+    uint8_t tx[6];
-+    tx[0] = (uint8_t)((addr >> 8) & 0xff);
-+    tx[1] = (uint8_t)(addr & 0xff);
-+    tx[2] = 0x00;               /* Dummy byte for high-speed SPI */
-+
-+    return geni_spi_transfer_sync(tx, 3, buf, len);
-+}
-+
 +static bool
-+sweet_touch_probe_novatek(void)
++nvt_read_id(uint32_t addr, uint8_t id[6])
  {
 -	const uint8_t ack[3] = {GOODIX_EVENT_REG >> 8, GOODIX_EVENT_REG & 0xffu, 0};
 -	return touch_msg(0x5d, ack, sizeof(ack), NULL, 0, false);
-+    uint8_t id_buf[8] = {0};
-+
-+    /* Attempt to read chip ID from NT36525B firmware table */
-+    if (nvt_set_page(0x3f000) != 0) {
-+        return false;
-+    }
-+    if (nvt_read_packet(0x00, id_buf, sizeof(id_buf)) != 0) {
-+        return false;
-+    }
-+
-+    printf("SWEET TOUCH: Novatek probe raw: %02x %02x %02x %02x\n",
-+           id_buf[0], id_buf[1], id_buf[2], id_buf[3]);
-+
-+    /* If NT36525B responds or signature matches */
-+    if ((id_buf[0] != 0xff && id_buf[0] != 0x00) ||
-+        (id_buf[1] != 0xff && id_buf[1] != 0x00)) {
-+        printf("SWEET TOUCH: detected Novatek NT36525B controller!\n");
-+        return true;
-+    }
-+
-+    return false;
- }
+-}
++	/* index, one dummy byte, then data: rbuf + 2 in CTP_SPI_READ */
++	uint8_t tx[8] = { NVT_READ(addr) };
++	uint8_t rx[8] = { 0 };
  
 -/* Raw read only: 0x8240 is the vendor's generic/older VERSION candidate,
 - * not a second accepted GT9896 identity. Never try a four-byte Berlin pointer:
 - * on this 16-bit IC the extra bytes would be register data writes. */
-+/* ============================================================================
-+ * 4. FocalTech FT5452 SPI Protocol Engine
-+ * ============================================================================ */
-+
- static int
+-static int
 -touch_probe_info(uint16_t reg, uint8_t *buf)
-+fts_spi_read_reg(uint8_t reg, uint8_t *val)
- {
+-{
 -	memset(buf, 0xa5, 32);
 -	int err = touch_read(0x5d, reg, true, buf, 32);
 -	printf("SWEET TOUCH: probe info reg=%#x len=32 err=%d irq=%#x seen=%#x\n",
@@ -894,70 +573,48 @@ index 370d18b..6e74c95 100644
 -			}
 -			printf("SWEET TOUCH: probe raw %#x: %s\n", reg + off, line);
 -		}
--	}
++	if (!nvt_set_page(addr) || !touch_xfer(tx, rx, sizeof(rx))) {
++		return false;
+ 	}
 -	return err;
-+    uint8_t tx[2] = {reg, 0x00};
-+    uint8_t rx[2] = {0, 0};
-+    int ret = geni_spi_transfer_sync(tx, 2, rx, 2);
-+    if (ret == 0 && val != NULL) {
-+        *val = rx[1];
-+    }
-+    return ret;
++	for (unsigned i = 0; i < 6; ++i) {
++		id[i] = rx[i + 2];
++	}
++	return true;
  }
  
 -static unsigned
 -touch_be16(const uint8_t *p)
-+static int
-+fts_spi_read_packet(uint8_t start_reg, uint8_t *buf, uint32_t len)
++/* trim_id_table in nt36xxx_mem_map.h */
++static bool
++nvt_id_is_525(const uint8_t id[6])
  {
 -	return ((unsigned)p[0] << 8) | p[1];
-+    uint8_t tx[1] = {start_reg};
-+    return geni_spi_transfer_sync(tx, 1, buf, len);
++	return id[3] == 0x25 && id[4] == 0x65 && id[5] == 0x03;
  }
  
  static bool
 -touch_checksum(const uint8_t *buf, unsigned len)
-+sweet_touch_probe_focaltech(void)
++nvt_id_is_blank(const uint8_t id[6])
  {
 -	if (len < 2) {
 -		return false;
--	}
++	bool zero = true, ones = true;
++	for (unsigned i = 0; i < 6; ++i) {
++		zero = zero && id[i] == 0x00;
++		ones = ones && id[i] == 0xff;
+ 	}
 -	unsigned sum = 0;
 -	for (unsigned i = 0; i + 2 < len; ++i) {
 -		sum += buf[i];
 -	}
 -	return (sum & 0xffffu) == touch_be16(buf + len - 2);
-+    uint8_t chip_id = 0;
-+    if (fts_spi_read_reg(FTS_REG_CHIP_ID, &chip_id) == 0) {
-+        printf("SWEET TOUCH: FocalTech probe chip-id = 0x%02x\n", chip_id);
-+        if (chip_id == FTS_CHIP_ID_FT5452 || chip_id == FTS_CHIP_ID_FT8719 || chip_id == FTS_CHIP_ID_FT8006) {
-+            printf("SWEET TOUCH: detected FocalTech SPI controller (ID 0x%02x)!\n", chip_id);
-+            g_touch.ic_type = TOUCH_IC_FOCALTECH_FT5452;
-+            return true;
-+        }
-+    }
-+    return false;
-+}
-+
-+/* ============================================================================
-+ * 5. Coordinate Processing & Userland HID Dispatch
-+ * ============================================================================ */
-+
-+static inline int
-+touch_scale_coord(int val, int max_src, int max_dst)
-+{
-+    if (max_src <= 0) {
-+        return val;
-+    }
-+    long scaled = ((long)val * max_dst) / max_src;
-+    if (scaled < 0) scaled = 0;
-+    if (scaled > max_dst) scaled = max_dst;
-+    return (int)scaled;
++	return zero || ones;
  }
  
  static void
 -touch_report(uint32_t mask, const int *x, const int *y)
-+sweet_touch_update_contacts(bool active[TOUCH_MAX_FINGERS], int x_coords[TOUCH_MAX_FINGERS], int y_coords[TOUCH_MAX_FINGERS])
++touch_probe(void)
  {
 -	for (unsigned id = 0; id < TOUCH_MAX; ++id) {
 -		uint32_t bit = 1u << id;
@@ -976,24 +633,12 @@ index 370d18b..6e74c95 100644
 -		}
 -	}
 -	st.active = mask;
-+    for (int f = 0; f < TOUCH_MAX_FINGERS; f++) {
-+        if (active[f]) {
-+            g_touch.finger_down[f] = true;
-+            g_touch.last_x[f]      = x_coords[f];
-+            g_touch.last_y[f]      = y_coords[f];
-+            sweet_hid_touch(f, 1, x_coords[f], y_coords[f]);
-+        } else if (g_touch.finger_down[f]) {
-+            g_touch.finger_down[f] = false;
-+            sweet_hid_touch(f, 0, g_touch.last_x[f], g_touch.last_y[f]);
-+        }
-+    }
- }
+-}
++	int reset_pin = 0;
  
 -static int
 -touch_goodix(void)
-+static void
-+sweet_touch_release_all(void)
- {
+-{
 -	uint8_t buf[90];
 -	int x[TOUCH_MAX] = {0}, y[TOUCH_MAX] = {0};
 -	uint32_t mask = 0;
@@ -1005,7 +650,26 @@ index 370d18b..6e74c95 100644
 -		/* Do not acknowledge firmware/config requests that we cannot service. */
 -		if (buf[0] & 0x40u) {
 -			return ENOTSUP;
--		}
++	(void)nvt_read_id(NVT_TRIM, st.cold);
++	(void)PE_parse_boot_argn("sweettouchrst", &reset_pin, sizeof(reset_pin));
++	if (reset_pin) {
++		uint32_t cfg = touch_rd(st.west, TOUCH_GPIO_CFG(TOUCH_PIN_RST)) & ~0x3ffu;
++		touch_wr(st.west, TOUCH_GPIO_IO(TOUCH_PIN_RST), 0);
++		touch_wr(st.west, TOUCH_GPIO_CFG(TOUCH_PIN_RST), cfg | (2u << 6) | 0x200u);
++		touch_wait(20);
++		touch_wr(st.west, TOUCH_GPIO_IO(TOUCH_PIN_RST), 2u);
++		touch_wait(100);
++	}
++	/* nvt_ts_probe: engineering reset, then nvt_ts_check_chip_ver_trim */
++	(void)nvt_write(NVT_ENG_RST, 0x5a);
++	touch_wait(10);
++	for (st.tries = 1; st.tries <= 5; ++st.tries) {
++		(void)nvt_write(NVT_SWRST_N8, 0x69);
++		touch_wait(5);
++		(void)nvt_write(NVT_RD_FAST, 0x00);
++		if (nvt_read_id(NVT_TRIM, st.id) && nvt_id_is_525(st.id)) {
++			break;
+ 		}
 -		return 0; /* no new touch frame: retain current contacts */
 -	}
 -	if (!touch_checksum(buf, GOODIX_HEAD_LEN)) {
@@ -1015,7 +679,8 @@ index 370d18b..6e74c95 100644
 -	if (n > TOUCH_MAX) {
 -		(void)touch_goodix_ack();
 -		return EIO;
--	}
++		touch_wait(10);
+ 	}
 -	if (n) {
 -		err = touch_read(0x5d, GOODIX_EVENT_REG + GOODIX_HEAD_LEN, true,
 -		    buf + GOODIX_HEAD_LEN, n * GOODIX_POINT_LEN + 2u);
@@ -1026,7 +691,20 @@ index 370d18b..6e74c95 100644
 -			(void)touch_goodix_ack();
 -			return EIO;
 -		}
--	}
++	if (!nvt_id_is_525(st.id)) {
++		(void)nvt_write(NVT_SWRST_N8, 0x69);
++		touch_wait(5);
++		(void)nvt_read_id(NVT_TRIM_OLD, st.old_id);
++	}
++	if (nvt_id_is_525(st.id) || nvt_id_is_525(st.old_id)) {
++		st.verdict = "CHIP OK nt36525 family";
++	} else if (st.errors) {
++		st.verdict = "SPI CONTROLLER ERRORS";
++	} else if (nvt_id_is_blank(st.id)) {
++		st.verdict = "NO ANSWER on MISO";
++	} else {
++		st.verdict = "UNKNOWN ID";
+ 	}
 -	for (unsigned i = 0; i < n; ++i) {
 -		const uint8_t *p = buf + GOODIX_HEAD_LEN + i * GOODIX_POINT_LEN;
 -		unsigned id = p[0] >> 4;
@@ -1036,29 +714,27 @@ index 370d18b..6e74c95 100644
 -		    (mask & (1u << id)) || px > 1079 || py > 2399) {
 -			(void)touch_goodix_ack();
 -			return EIO;
--		}
++	/* Sampled, never changed. Android's flags say rising edge, so report the idle level. */
++	st.irq_samples = 200;
++	for (unsigned i = 0; i < st.irq_samples; ++i) {
++		if (!(touch_rd(st.west, TOUCH_GPIO_IO(TOUCH_PIN_IRQ)) & 1u)) {
++			st.irq_low++;
+ 		}
 -		mask |= 1u << id;
 -		x[id] = (int)px;
 -		y[id] = (int)py;
--	}
++		touch_wait(1);
+ 	}
 -	err = touch_goodix_ack();
 -	if (!err) {
 -		touch_report(mask, x, y);
 -	}
 -	return err;
-+    for (int f = 0; f < TOUCH_MAX_FINGERS; f++) {
-+        if (g_touch.finger_down[f]) {
-+            g_touch.finger_down[f] = false;
-+            sweet_hid_touch(f, 0, g_touch.last_x[f], g_touch.last_y[f]);
-+        }
-+    }
  }
  
 -static int
 -touch_focaltech(void)
-+static void
-+sweet_touch_poll_novatek(void)
- {
+-{
 -	uint8_t buf[63];
 -	int x[TOUCH_MAX] = {0}, y[TOUCH_MAX] = {0};
 -	uint32_t mask = 0, seen = 0;
@@ -1134,45 +810,12 @@ index 370d18b..6e74c95 100644
 -	(void)active;   /* topaz: byte 2 does not always match the records */
 -	touch_report(mask, x, y);
 -	return 0;
-+    uint8_t pkt[NVT_TOUCH_PACKET_LEN] = {0};
-+
-+    if (nvt_read_packet(g_touch.nvt_event_buf_addr, pkt, sizeof(pkt)) != 0) {
-+        return;
-+    }
-+
-+    bool active[TOUCH_MAX_FINGERS]   = {false};
-+    int x_coords[TOUCH_MAX_FINGERS] = {0};
-+    int y_coords[TOUCH_MAX_FINGERS] = {0};
-+
-+    for (int i = 0; i < TOUCH_MAX_FINGERS; i++) {
-+        int off = 1 + i * 6;
-+        if (off + 5 >= (int)sizeof(pkt)) {
-+            break;
-+        }
-+
-+        uint8_t status = pkt[off];
-+        if (status == 0 || status == 0xff) {
-+            continue;
-+        }
-+
-+        int raw_x = (((int)pkt[off + 1] & 0x0f) << 8) | (int)pkt[off + 2];
-+        int raw_y = (((int)pkt[off + 3] & 0x0f) << 8) | (int)pkt[off + 4];
-+        int touch_id = (pkt[off + 1] >> 4) & 0x0f;
-+
-+        if (touch_id < TOUCH_MAX_FINGERS) {
-+            active[touch_id]   = true;
-+            x_coords[touch_id] = touch_scale_coord(raw_x, g_touch.abs_x_max, HID_VIRTUAL_WIDTH);
-+            y_coords[touch_id] = touch_scale_coord(raw_y, g_touch.abs_y_max, HID_VIRTUAL_HEIGHT);
-+        }
-+    }
-+
-+    sweet_touch_update_contacts(active, x_coords, y_coords);
- }
- 
+-}
+-
 -static bool
 -touch_se_init(void)
 +static void
-+sweet_touch_poll_focaltech(void)
++touch_report(void)
  {
 -	uint32_t fw = touch_rd(st.se, SE_FW);
 -	uint32_t tx = touch_rd(st.se, SE_HW_TX), rx = touch_rd(st.se, SE_HW_RX);
@@ -1231,63 +874,29 @@ index 370d18b..6e74c95 100644
 -		return false;
 -	}
 -	return true;
-+    uint8_t buf[FTS_PACKET_LENGTH] = {0};
-+
-+    if (fts_spi_read_packet(FTS_REG_FLOW_WORK_MD, buf, sizeof(buf)) != 0) {
-+        return;
-+    }
-+
-+    int point_cnt = buf[2] & 0x0f;
-+    if (point_cnt == 0 || point_cnt > TOUCH_MAX_FINGERS) {
-+        sweet_touch_release_all();
-+        return;
-+    }
-+
-+    bool active[TOUCH_MAX_FINGERS]   = {false};
-+    int x_coords[TOUCH_MAX_FINGERS] = {0};
-+    int y_coords[TOUCH_MAX_FINGERS] = {0};
-+
-+    for (int i = 0; i < point_cnt; i++) {
-+        int off = 3 + i * 6;
-+        if (off + 5 >= (int)sizeof(buf)) {
-+            break;
-+        }
-+
-+        uint8_t event_flag = (buf[off] >> 6) & 0x03;
-+        int touch_id       = (buf[off + 2] >> 4) & 0x0f;
-+        int raw_x          = (((int)buf[off] & 0x0f) << 8) | (int)buf[off + 1];
-+        int raw_y          = (((int)buf[off + 2] & 0x0f) << 8) | (int)buf[off + 3];
-+
-+        if (touch_id >= TOUCH_MAX_FINGERS) {
-+            continue;
-+        }
-+
-+        if (event_flag == FTS_TOUCH_DOWN || event_flag == FTS_TOUCH_CONTACT) {
-+            active[touch_id]   = true;
-+            x_coords[touch_id] = touch_scale_coord(raw_x, g_touch.abs_x_max, HID_VIRTUAL_WIDTH);
-+            y_coords[touch_id] = touch_scale_coord(raw_y, g_touch.abs_y_max, HID_VIRTUAL_HEIGHT);
-+        }
-+    }
-+
-+    sweet_touch_update_contacts(active, x_coords, y_coords);
++	printf("SWEET TOUCH: >>> %s <<< errors=%u tries=%d\n", st.verdict, st.errors, st.tries);
++	printf("SWEET TOUCH: id %02x %02x %02x %02x %02x %02x | cold %02x %02x %02x %02x %02x %02x"
++	    " | old %02x %02x %02x %02x %02x %02x\n",
++	    st.id[0], st.id[1], st.id[2], st.id[3], st.id[4], st.id[5],
++	    st.cold[0], st.cold[1], st.cold[2], st.cold[3], st.cold[4], st.cold[5],
++	    st.old_id[0], st.old_id[1], st.old_id[2], st.old_id[3], st.old_id[4], st.old_id[5]);
++	printf("SWEET TOUCH: fw=%#x irq low %u/%u cfg=%#x | rst cfg=%#x io=%#x\n",
++	    st.fw, st.irq_low, st.irq_samples, st.irq_cfg, st.rst_cfg, st.rst_io);
  }
  
-+/* ============================================================================
-+ * 6. Kernel Polling Thread & Initialization Entry Point
-+ * ============================================================================ */
-+
  static void
--touch_thread(void *arg, wait_result_t result)
-+sweet_touch_thread(void *arg __unused, wait_result_t wres __unused)
+ touch_thread(void *arg, wait_result_t result)
  {
 -	unsigned delay_s = 45;
--	(void)arg;
--	(void)result;
++	unsigned delay_s = 6;
++
+ 	(void)arg;
+ 	(void)result;
 -	/*
 -	 * Start late (boot-arg sweettouchdelay, seconds): if the bus access
 -	 * below hangs the SoC, the persistent log and the GUI got there first.
 -	 */
--	(void)PE_parse_boot_argn("sweettouchdelay", &delay_s, sizeof(delay_s));
+ 	(void)PE_parse_boot_argn("sweettouchdelay", &delay_s, sizeof(delay_s));
 -	printf("SWEET TOUCH: starting in %u s\n", delay_s);
 -	touch_wait(delay_s * 1000u);
 -	st.stage = "map";
@@ -1297,17 +906,26 @@ index 370d18b..6e74c95 100644
 -	st.east = ml_io_map(TOUCH_EAST_PA, 0x25000);
 -	st.se = ml_io_map(TOUCH_SE_PA, 0x4000);
 -	if (!st.gcc || !st.west || !st.east || !st.se) {
--		printf("SWEET TOUCH: MMIO mapping failed\n");
--		goto out;
--	}
++	printf("SWEET TOUCH: fog stage 1, starting in %u s\n", delay_s);
++	if (delay_s) {
++		touch_wait(delay_s * 1000u);
++	}
++	st.se = ml_io_map(TOUCH_SE_PA, TOUCH_SE_SIZE);
++	st.gcc = ml_io_map(TOUCH_GCC_PA, TOUCH_GCC_SIZE);
++	st.west = ml_io_map(TOUCH_WEST_PA, TOUCH_WEST_SIZE);
++	if (!st.se || !st.gcc || !st.west) {
+ 		printf("SWEET TOUCH: MMIO mapping failed\n");
+ 		goto out;
+ 	}
 -	st.stage = "clocks";
--	if (!touch_clocks()) {
--		goto out;
--	}
+ 	if (!touch_clocks()) {
+ 		goto out;
+ 	}
 -	st.stage = "se2 init";
--	if (!touch_se_init()) {
--		goto out;
--	}
++	touch_pins();
+ 	if (!touch_se_init()) {
+ 		goto out;
+ 	}
 -	st.stage = "power/reset";
 -	printf("SWEET TOUCH: TLMM reset=%#x irq=%#x avdd=%#x\n",
 -	    touch_rd(st.west, TOUCH_GPIO_IO(TOUCH_PIN_RESET)),
@@ -1355,7 +973,12 @@ index 370d18b..6e74c95 100644
 -		printf("SWEET TOUCH: no unique supported IC (goodix=%d fts=%d dead=%d); stopping\n",
 -		    goodix, fts, st.dead);
 -		goto out;
--	}
++	touch_probe();
++	/* Repeat for a while: the screen is the only log, so leave time for a photo. */
++	for (unsigned i = 0; i < 6; ++i) {
++		touch_report();
++		touch_wait(20000);
+ 	}
 -	st.kind = goodix ? TOUCH_GOODIX : TOUCH_FTS;
 -	st.stage = "polling";
 -	printf("SWEET TOUCH: selected %s, 1080x2400, poll=10ms irq-hint=%d\n",
@@ -1391,7 +1014,7 @@ index 370d18b..6e74c95 100644
 -		touch_wait(10);
 -	}
 -	touch_report(0, st.x, st.y);
--out:
+ out:
 -	if (st.diag) {
 -		panic("SWEET TOUCH diag: stopped at '%s' dead=%d | gcc vote=%#x cfg=%#x cbcr=%#x | "
 -		    "se2 fw=%#x status=%#x hwtx=%#x hwrx=%#x | goodix err=%d | ft 0x38 err=%d/%d id=%02x:%02x | irq=%#x",
@@ -1399,145 +1022,23 @@ index 370d18b..6e74c95 100644
 -		    st.d_fw, st.d_status, st.d_hwtx, st.d_hwrx, st.d_ge,
 -		    st.d_fe1, st.d_fe2, st.d_fid1, st.d_fid2, st.irq_status);
 -	}
--	(void)thread_terminate(current_thread());
--	thread_block(THREAD_CONTINUE_NULL);
-+    unsigned delay_s = 6;
-+    (void)PE_parse_boot_argn("sweettouchdelay", &delay_s, sizeof(delay_s));
-+    if (delay_s > 0) {
-+        printf("SWEET TOUCH: waiting %u s for display & SpringBoard initialization...\n", delay_s);
-+        touch_thread_sleep_ms(delay_s * 1000U);
-+    }
-+
-+    printf("SWEET TOUCH: thread started (fog SM6225 QUP0 SE0 SPI)\n");
-+
-+    /* Map MMIO regions */
-+    g_touch.tlmm_base = (volatile uintptr_t)ml_io_map(SM6225_TLMM_WEST_PHYS, SM6225_TLMM_WEST_SIZE);
-+    g_touch.gcc_base  = (volatile uintptr_t)ml_io_map(SM6225_GCC_PHYS,       SM6225_GCC_SIZE);
-+    g_touch.spi_base  = (volatile uintptr_t)ml_io_map(SM6225_QUP0_SE0_PHYS,  SM6225_QUP0_SE0_SIZE);
-+
-+    if (!g_touch.tlmm_base || !g_touch.gcc_base || !g_touch.spi_base) {
-+        printf("SWEET TOUCH: ml_io_map failed (tlmm=%p gcc=%p spi=%p)\n",
-+               (void *)g_touch.tlmm_base, (void *)g_touch.gcc_base, (void *)g_touch.spi_base);
-+        (void)thread_terminate(current_thread());
-+        thread_block(THREAD_CONTINUE_NULL);
-+    }
-+
-+    /* Default touch coordinate range matches Redmi 10C 720x1650 panel */
-+    g_touch.abs_x_max          = TOUCH_SCREEN_WIDTH;
-+    g_touch.abs_y_max          = TOUCH_SCREEN_HEIGHT;
-+    g_touch.nvt_event_buf_addr = NVT_EVENT_BUF_ADDR_DEFAULT;
-+    g_touch.ic_type            = TOUCH_IC_NONE;
-+
-+    /* 1. Initialize GCC clocks and TLMM WEST pins */
-+    if (sweet_touch_clocks_init() != 0) {
-+        printf("SWEET TOUCH: failed to initialize QUP0 SE0 clocks, stopping touch thread\n");
-+        (void)thread_terminate(current_thread());
-+        thread_block(THREAD_CONTINUE_NULL);
-+    }
-+    sweet_touch_pins_init();
-+
-+    /* 2. Initialize QUP0 SE0 GENI SPI controller */
-+    (void)geni_spi_init();
-+
-+    /*
-+     * 3. Probe controllers:
-+     * First check if Novatek NT36525B firmware is already running in SRAM
-+     * (loaded by ABL's DSI panel init before jumping to XNU). If not responding,
-+     * toggle GPIO 86 hardware reset (20 ms low, 250 ms high) and probe both
-+     * Novatek NT36525B and FocalTech SPI controllers.
-+     */
-+    if (sweet_touch_probe_novatek()) {
-+        g_touch.ic_type = TOUCH_IC_NOVATEK_NT36525B;
-+    } else {
-+        printf("SWEET TOUCH: toggling reset on GPIO %d (20ms low, 250ms high)\n", TOUCH_PIN_RST);
-+        sweet_touch_hw_reset();
-+
-+        if (sweet_touch_probe_novatek()) {
-+            g_touch.ic_type = TOUCH_IC_NOVATEK_NT36525B;
-+        } else if (sweet_touch_probe_focaltech()) {
-+            /* g_touch.ic_type set by sweet_touch_probe_focaltech() */
-+        } else {
-+            /*
-+             * Fallback: if neither probe matched a signature (e.g. Novatek
-+             * zero-flash firmware awaiting first touch interrupt), default to
-+             * Novatek NT36525B on EVENT_BUF_ADDR 0x3f310.
-+             */
-+            g_touch.ic_type = TOUCH_IC_NOVATEK_NT36525B;
-+            (void)nvt_set_page(g_touch.nvt_event_buf_addr);
-+            printf("SWEET TOUCH: probe fallback to Novatek NT36525B fast-read mode\n");
-+        }
-+    }
-+
-+    printf("SWEET TOUCH: entering polling loop on GPIO %d (ic_type=%d)\n",
-+           TOUCH_PIN_IRQ, (int)g_touch.ic_type);
-+
-+    bool had_active_touches = false;
-+
-+    /* 4. Main polling loop checking GPIO 80 (active-low IRQ) */
-+    for (;;) {
-+        bool irq = sweet_touch_irq_asserted();
-+        if (irq || had_active_touches) {
-+            if (g_touch.ic_type == TOUCH_IC_NOVATEK_NT36525B) {
-+                sweet_touch_poll_novatek();
-+            } else if (g_touch.ic_type == TOUCH_IC_FOCALTECH_FT5452) {
-+                sweet_touch_poll_focaltech();
-+            }
-+
-+            had_active_touches = false;
-+            for (int f = 0; f < TOUCH_MAX_FINGERS; f++) {
-+                if (g_touch.finger_down[f]) {
-+                    had_active_touches = true;
-+                    break;
-+                }
-+            }
-+            touch_thread_sleep_ms(irq ? 4 : 8);
-+        } else {
-+            touch_thread_sleep_ms(10);
-+        }
-+    }
++	printf("SWEET TOUCH: stage 1 finished\n");
+ 	(void)thread_terminate(current_thread());
+ 	thread_block(THREAD_CONTINUE_NULL);
  }
- 
- void
- sweet_touch_init(void)
+@@ -745,14 +481,12 @@ sweet_touch_init(void)
  {
--	int enabled = 1;
--	thread_t thread;
--	if (st.started) {
--		return;
--	}
--	st.started = true;
--	(void)PE_parse_boot_argn("sweettouch", &enabled, sizeof(enabled));
+ 	int enabled = 1;
+ 	thread_t thread;
++
+ 	if (st.started) {
+ 		return;
+ 	}
+ 	st.started = true;
+ 	(void)PE_parse_boot_argn("sweettouch", &enabled, sizeof(enabled));
 -	st.irq_hint = 1; /* topaz: read on IRQ GPIO80 low, while touching, else every 100 ms */
 -	(void)PE_parse_boot_argn("sweettouchirq", &st.irq_hint, sizeof(st.irq_hint));
 -	(void)PE_parse_boot_argn("sweettouchdiag", &st.diag, sizeof(st.diag));
--	if (!enabled) {
--		printf("SWEET TOUCH: disabled (sweettouch=0)\n");
--		return;
--	}
--	kern_return_t kr = kernel_thread_start(touch_thread, NULL, &thread);
--	if (kr == KERN_SUCCESS) {
--		thread_deallocate(thread);
--	} else {
--		printf("SWEET TOUCH: kernel_thread_start failed %d\n", kr);
--	}
-+    int en = 1;
-+    thread_t th = THREAD_NULL;
-+
-+    if (g_touch_started) {
-+        return;
-+    }
-+    g_touch_started = 1;
-+
-+    if (PE_parse_boot_argn("sweettouch", &en, sizeof(en)) && en == 0) {
-+        printf("SWEET TOUCH: disabled by boot-arg sweettouch=0\n");
-+        return;
-+    }
-+
-+    if (kernel_thread_start(sweet_touch_thread, NULL, &th) == KERN_SUCCESS) {
-+        thread_deallocate(th);
-+    } else {
-+        printf("SWEET TOUCH: failed to start polling thread\n");
-+    }
- }
--#endif /* ARM64_BOARD_CONFIG_SWEET */
-
+ 	if (!enabled) {
+ 		printf("SWEET TOUCH: disabled (sweettouch=0)\n");
+ 		return;
