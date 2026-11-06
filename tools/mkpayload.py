@@ -132,6 +132,29 @@ def add_ramdisk_to_adt(adt_blob, phys, size):
     return adt.serialize(root)
 
 
+def max_phandle(node):
+    v = node.prop('AAPL,phandle')
+    own = struct.unpack('<I', v)[0] if v else 0
+    return max([own] + [max_phandle(c) for c in node.children])
+
+
+def add_touch_fw_to_adt(adt_blob, path):
+    """Return the ADT with /sweet-touch firmware = the IC's firmware file.
+
+    bsd/dev/sweet_touch.c loads it into the Novatek IC. It is a device file, kept
+    out of git, so it only ever goes in locally built images.
+    """
+    root, _ = adt.parse(adt_blob)
+    assert not any(c.name == 'sweet-touch' for c in root.children), 'ADT already has /sweet-touch'
+    n = adt.Node()
+    n.props = [('name', 0, b'sweet-touch\0'),
+               ('AAPL,phandle', 0, struct.pack('<I', max_phandle(root) + 1)),
+               ('firmware', 0, open(path, 'rb').read())]
+    n.children = []
+    root.children.append(n)
+    return adt.serialize(root)
+
+
 def adt_dram(adt_blob):
     """Kernel-managed RAM <base, size> from the ADT's /chosen dram-base/dram-size."""
     root, _ = adt.parse(adt_blob)
@@ -140,7 +163,7 @@ def adt_dram(adt_blob):
             struct.unpack('<Q', chosen.prop('dram-size'))[0])
 
 
-def build(kernel_path, adt_path, cmdline, ramdisk_path=None):
+def build(kernel_path, adt_path, cmdline, ramdisk_path=None, touch_fw=None):
     buf = bytearray(open(kernel_path, 'rb').read())
     m = parse_macho(buf)
     nfix = apply_chained_fixups(buf, m)
@@ -154,6 +177,8 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None):
     kernel_end = (kernel_end + PAGE - 1) & ~(PAGE - 1)
 
     adt_blob = open(adt_path, 'rb').read()
+    if touch_fw:
+        adt_blob = add_touch_fw_to_adt(adt_blob, touch_fw)
     # The ADT decides where the kernel's RAM is (mkadt.py --highmem).
     PHYS_BASE, MEM_SIZE = adt_dram(adt_blob)
     pieces = [(s['vmaddr'], s['vmsize'], buf[s['fileoff']:s['fileoff'] + s['filesize']]) for s in segs]
@@ -198,8 +223,9 @@ if __name__ == '__main__':
     ap.add_argument('kernel'); ap.add_argument('adt'); ap.add_argument('out')
     ap.add_argument('--cmdline', default='debug=0xc serial=3 cpus=1 keepsyms=1')
     ap.add_argument('--ramdisk', help='root image for md0 (boot with rd=md0)')
+    ap.add_argument('--touch-fw', help='Novatek firmware for the touch IC, kept out of git')
     a = ap.parse_args()
-    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk)
+    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk, a.touch_fw)
     open(a.out, 'wb').write(blob)
     for k, v in info.items():
         if k != 'segs':
