@@ -1,0 +1,119 @@
+From: MeizIshanDev <mezan@meshan.dev>
+Subject: [PATCH] fog-0961: gpu: fog's zap region and the phone's own firmware
+
+topaz's zap region 0x55B15000 is inside fog's pil_adsp_region; fog.dtb has
+gpu_region@56615000. topaz's embedded zap header differs from fog's stock file
+in its signature data and its SQE is another version, so take the firmware from
+/sweet-gpu in the ADT (mkpayload.py --gpu-fw), and without it leave the GPU off.
+
+---
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+index 16da336..5f73edc 100644
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -21,6 +21,7 @@
+ #include <IOKit/IOBufferMemoryDescriptor.h>
+ #include <IOKit/IOLocks.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
+ #include <kern/thread.h>
+ #include <mach/mach_time.h>
+ 
+@@ -64,7 +65,7 @@ uint32_t gpu_log;
+ #define SMMU_BASE       0x059A0000ull
+ #define SMMU_SIZE       0x10000
+ #define SMMU_CB0        0x8000
+-#define ZAP_REGION      0x55B15000ull
++#define ZAP_REGION      0x56615000ull   /* fog: gpu_region@56615000 in its device tree */
+ #define ZAP_REGION_SIZE 0x2000
+ #define GPU_PAS_ID      13
+ 
+@@ -565,6 +566,49 @@ scm(uint32_t fn, uint64_t arginfo, uint64_t a, uint64_t b, uint64_t c, uint64_t
+ 	return args[0];
+ }
+ 
++/*
++ * fog: the phone's own firmware, from /sweet-gpu in the ADT (mkpayload.py --gpu-fw).
++ * The embedded files are topaz's: its zap header carries different signature data
++ * and its SQE is another version. With none in the ADT the GPU stays off.
++ */
++static const uint8_t *fog_zap_mdt, *fog_zap_b02, *fog_sqe_fw;
++static size_t fog_zap_mdt_size, fog_zap_b02_size, fog_sqe_fw_size;
++
++static bool
++fog_fw_prop(DTEntry node, const char *name, const uint8_t **data, size_t *size)
++{
++	void const *value = NULL;
++	unsigned int length = 0;
++
++	if (SecureDTGetProperty(node, name, &value, &length) != kSuccess || length <= 4) {
++		IOLog("TopazGPU: no %s in /sweet-gpu\n", name);
++		return false;
++	}
++	/* Copied: the device tree is only sure to stay around this early. */
++	void *copy = IOMalloc(length);
++	if (copy == NULL) {
++		return false;
++	}
++	memcpy(copy, value, length);
++	*data = (const uint8_t *)copy;
++	*size = length;
++	return true;
++}
++
++static bool
++fog_fw_load(void)
++{
++	DTEntry node;
++
++	if (SecureDTLookupEntry(NULL, "/sweet-gpu", &node) != kSuccess) {
++		IOLog("TopazGPU: no /sweet-gpu in the ADT\n");
++		return false;
++	}
++	return fog_fw_prop(node, "zap-mdt", &fog_zap_mdt, &fog_zap_mdt_size) &&
++	       fog_fw_prop(node, "zap-b02", &fog_zap_b02, &fog_zap_b02_size) &&
++	       fog_fw_prop(node, "sqe", &fog_sqe_fw, &fog_sqe_fw_size);
++}
++
+ static bool
+ zap_load(void)
+ {
+@@ -573,11 +617,11 @@ zap_load(void)
+ 	struct kbuf meta = {};
+ 	bool ok = false;
+ 
+-	IOLog("TopazGPU: zap: embedded firmware (%zu + %zu bytes)\n", topaz_fw_zap_mdt_size, topaz_fw_zap_b02_size);
+-	mdt = (void *)topaz_fw_zap_mdt;
+-	mdt_size = topaz_fw_zap_mdt_size;
+-	seg = (void *)topaz_fw_zap_b02;
+-	seg_size = topaz_fw_zap_b02_size;
++	IOLog("TopazGPU: zap: firmware from the ADT (%zu + %zu bytes)\n", fog_zap_mdt_size, fog_zap_b02_size);
++	mdt = (void *)fog_zap_mdt;
++	mdt_size = fog_zap_mdt_size;
++	seg = (void *)fog_zap_b02;
++	seg_size = fog_zap_b02_size;
+ 	{
+ 		const uint8_t *m = (const uint8_t *)mdt;
+ 		uint32_t phoff = *(const uint32_t *)(m + 28), phnum = *(const uint16_t *)(m + 44);
+@@ -956,8 +1000,8 @@ cp_start(void)
+ 	void *fw = NULL;
+ 	size_t fw_size = 0;
+ 
+-	fw = (void *)topaz_fw_sqe_fw;
+-	fw_size = topaz_fw_sqe_fw_size;
++	fw = (void *)fog_sqe_fw;
++	fw_size = fog_sqe_fw_size;
+ 	IOLog("TopazGPU: cp: SQE %zu bytes, allocating ring\n", fw_size);
+ 	if ((sqe.md == NULL && (!kbuf_alloc(&sqe, fw_size - 4) || !kbuf_map(&sqe))) ||
+ 	    (ring.md == NULL && (!kbuf_alloc(&ring, RB_BYTES) || !kbuf_map(&ring))) ||
+@@ -1217,6 +1261,10 @@ topaz_adreno_init(void)
+ 	if (!PE_parse_boot_argn("gpu", &on, sizeof(on)) || on == 0 || hw_lock != NULL) {
+ 		return;
+ 	}
++	if (!fog_fw_load()) {
++		IOLog("TopazGPU: THE GPU IS NOT STARTED: firmware missing\n");
++		return;
++	}
+ 	(void)PE_parse_boot_argn("gpu_identity", &gpu_identity, sizeof(gpu_identity));
+ 	(void)PE_parse_boot_argn("gpu_midmem", &gpu_midmem, sizeof(gpu_midmem));
+ 	if (PE_parse_boot_argn("gpu_mhz", &mhz, sizeof(mhz)) && mhz >= 300) {
