@@ -1,5 +1,31 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## fog (Redmi 10C) handoff, 2026-11-06 (read this first for fog)
+
+**State: Novatek firmware runs on the touch IC under the iOS kernel. Touch does not reach iOS yet.** Commit `882b8a7`, CI run 42137139122.
+
+Last on-device result (boot `shim-boot-x16-fw.img`, photo of the log viewer):
+`FW RUNNING tries=1`, id `0b 00 00 25 65 03`, fw 118784 bytes 19 parts, `16bits=1309` ticks, `load=1689 ms`, `state=0xa0 late=0xa0`,
+`ver=0xd bar=0xf2 tx=18 rx=32 x=720 y=1650 pid=0x5968`, `irq low 2000/2000 cfg=0`, `rst cfg=0x2c0 io=0x3`.
+
+Observed on the phone (fog):
+- QUP0 SE0 `fw=0x102`, `fifo_off=1`: FIFO interface disabled, so only GSI DMA (GPI at 0x4a00000, behind the SMMU). Not used: SPI mode 0 is bit-banged on GPIO 0-3.
+- Pin order MISO=0, MOSI=1, CLK=2, CS=3 (found by trying the orders; earlier notes with MOSI=0/MISO=1/CS=2/CLK=3 were wrong).
+- Android's trim table maps `0b .. 25 65 03` to the NT36672A register map with hw_crc=1: event buffer 0x21C00, not the 0x11A00 of the NT36525 map.
+- The firmware equals `/firmware/novatek_ts_fw.bin` in the stock `miui_FOGGlobal_V14.0.9.0.TGEMIXM` vendor image (sha256 234f437f...). It is in `shim/out/novatek_ts_fw.bin`, kept out of git; `mkpayload.py --touch-fw` puts it in the ADT as /sweet-touch "firmware".
+- GitHub retired macos-14. CI now uses macos-15 with Xcode 16 and patch 0955 (IORPC.kernelContent); that kernel reached the lockscreen with Siri working.
+
+Reading logs: no recovery has adb while iOS is on userdata. `SHIM_EXTRA_CFLAGS=-DLOGVIEW shim/build.sh` builds a read-only viewer (blue screen) that shows TOUCH and panic lines of the persistent log. Copy at `shim/out/shim-boot-logview.img`. Boot it right after the boot under test, and check that `total=`/`flush=` changed, or it is an older boot's log. The log flushes every ~10 s.
+
+Boot quirks: `Load Error` needs `fastboot --set-active=a`, then send again. `Status read failed (Too many links)` or backlight flashing on a black screen is a failed early boot: send again. Some boots reboot before the Apple logo for an unknown reason, including with touch off and on the old Xcode 15 kernel; retrying has worked. The console stops at `mpo_policy_init for vnguard` on good boots too, so that line is not a crash point. Without console text the grey bar is the boot progress bar (no -noprogress). WSL's git credential helper is broken: push with a one-off `gh auth token` helper.
+
+Next, in order:
+1. `state` stayed 0xa0 after 3 s and IRQ read low in all 2000 samples. Guess, not verified: the fw may want more host steps or a touch during the sample window, and the window may have missed the fingers. Android's probe and `nvt_ts_work_func` are the reference. Check the state later and over a longer window.
+2. Read the event buffer (page 0x21C00, index 0, 65 bytes) while the user taps and print raw records. Parse as `nvt_ts_work_func`: id = b0>>3 (1-based), state = b0&7 (1/2 = down), x = b1<<4|b3>>4, y = b2<<4|b3&0xf. `POINT_DATA_CHECKSUM` is on in that driver.
+3. Scale to the 1080x2400 range SweetHID expects and call sweet_hid_touch. Poll without starving the UI (cpus=1); each 65-byte read costs bit-banged time.
+
+Local helpers, not in git: `~/ios-fog/fog-session-tools` (zipget.py fetches only the kernel from the artifact zip with range requests, ~100 s instead of ~20 min; mkimg2.sh builds an image with the firmware; nvt_sim.c + stage2_test.sh run the driver against a simulated IC).
+
 ## Agent handoff / active work (2026-10-15, latest)
 
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<
