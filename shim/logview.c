@@ -72,8 +72,13 @@ static void end_line(void)
 	tail[tail_next][keep] = 0;
 	tail_next = (tail_next + 1) % TAIL_LINES;
 
+#ifdef LOGVIEW_GPU
+	if (!contains(line, len, "TopazGPU") && !contains(line, len, ">>>") && !contains(line, len, "panic"))
+		return;
+#else
 	if (!contains(line, len, "TOUCH") && !contains(line, len, "panic"))
 		return;
+#endif
 	hits++;
 	if (seen_before(line, len))
 		return;
