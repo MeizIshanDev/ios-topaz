@@ -2,11 +2,18 @@
 
 ## fog (Redmi 10C) handoff, 2026-11-06 (read this first for fog)
 
-**State: Novatek firmware runs on the touch IC under the iOS kernel. Touch does not reach iOS yet.** Commit `882b8a7`, CI run 42137139122.
+**MILESTONE: touch works in iOS on fog and survives lock/wake** (user-tested on boot `shim-boot-x16-nosleep.img`, commit `b090322`, CI run 42193382335). Build the image with `mkpayload.py --touch-fw shim/out/novatek_ts_fw.bin`, args `sweettouch=1 sweettouchdelay=20 sweetfb_noconsole=1 ufslogsecs=1`. Without the firmware in the ADT the driver stops at `NO FIRMWARE in ADT`.
 
-Last on-device result (boot `shim-boot-x16-fw.img`, photo of the log viewer):
-`FW RUNNING tries=1`, id `0b 00 00 25 65 03`, fw 118784 bytes 19 parts, `16bits=1309` ticks, `load=1689 ms`, `state=0xa0 late=0xa0`,
-`ver=0xd bar=0xf2 tx=18 rx=32 x=720 y=1650 pid=0x5968`, `irq low 2000/2000 cfg=0`, `rst cfg=0x2c0 io=0x3`.
+How touch works now: `bsd/dev/sweet_touch.c` (patch 0960) bit-bangs SPI, downloads the firmware (about 1.7 s), then reads 65-byte frames from page 0x21C00. The TLMM latches the IRQ's rising edge in the pin's status register, polled every 5 ms with no GIC interrupt; a timed read covers a missing IRQ. Idle frames read all ff and count as `bad`: seen with no finger down, and harmless so far. AppleCLCD calls `sweet_touch_panel_power`; on wake the firmware is downloaded again.
+
+**Do not send the IC's deep sleep command (EVENT_HOST_CMD 0x11).** With it the display stayed black with no backlight: iOS power-cycles the display during boot, this IC also drives the panel, and the wake path is only DCS 0x11/0x29, not Android's full panel init. The cause is inferred: removing the command fixed it.
+
+Open:
+- One boot rebooted right after the first swipe (image x16-touch2, log flushing every 10 s, so the cause was not captured). Not seen on later boots. Keep `ufslogsecs=1` so the next one is logged.
+- Some boots reboot before the Apple logo; cause unknown, retrying has worked.
+- Touch comes back about 1.7 s after wake, the firmware download time. `state` stays 0xa0 and it works anyway.
+
+GPU next: `gpu=1` exists from topaz (0901+, userland/gpu, userland/mesa). Read-only comparison with fog.dtb: GPU 0x5900000, SMMU 0x59a0000, chip ID 0x6010001 and the firmware names match, **but the zap region differs: driver 0x55B15000 (topaz), fog `gpu_region@56615000` size 0x2000.** The topaz value is inside fog's pil_adsp_region: do not run gpu=1 before changing it. GPUCC 0x05990000 is not yet checked against fog.dtb. It also needs a610_zap and a630_sqe.fw in the root at /usr/share/firmware/topaz (stock ROM vendor, not confirmed present), Mesa built on macOS (needs a CI job), and a root reflash.
 
 Observed on the phone (fog):
 - QUP0 SE0 `fw=0x102`, `fifo_off=1`: FIFO interface disabled, so only GSI DMA (GPI at 0x4a00000, behind the SMMU). Not used: SPI mode 0 is bit-banged on GPIO 0-3.
@@ -19,7 +26,7 @@ Reading logs: no recovery has adb while iOS is on userdata. `SHIM_EXTRA_CFLAGS=-
 
 Boot quirks: `Load Error` needs `fastboot --set-active=a`, then send again. `Status read failed (Too many links)` or backlight flashing on a black screen is a failed early boot: send again. Some boots reboot before the Apple logo for an unknown reason, including with touch off and on the old Xcode 15 kernel; retrying has worked. The console stops at `mpo_policy_init for vnguard` on good boots too, so that line is not a crash point. Without console text the grey bar is the boot progress bar (no -noprogress). WSL's git credential helper is broken: push with a one-off `gh auth token` helper.
 
-Next, in order:
+Done since (kept for the record):
 1. `state` stayed 0xa0 after 3 s and IRQ read low in all 2000 samples. Guess, not verified: the fw may want more host steps or a touch during the sample window, and the window may have missed the fingers. Android's probe and `nvt_ts_work_func` are the reference. Check the state later and over a longer window.
 2. Read the event buffer (page 0x21C00, index 0, 65 bytes) while the user taps and print raw records. Parse as `nvt_ts_work_func`: id = b0>>3 (1-based), state = b0&7 (1/2 = down), x = b1<<4|b3>>4, y = b2<<4|b3&0xf. `POINT_DATA_CHECKSUM` is on in that driver.
 3. Scale to the 1080x2400 range SweetHID expects and call sweet_hid_touch. Poll without starving the UI (cpus=1); each 65-byte read costs bit-banged time.
