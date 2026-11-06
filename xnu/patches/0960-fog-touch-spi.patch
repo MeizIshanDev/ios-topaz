@@ -7,12 +7,13 @@ Load the firmware the way nt36525b_spi does (hardware CRC, NT36672A register
 map), from /sweet-touch in the ADT (mkpayload.py --touch-fw). Read touch frames
 as nvt_ts_work_func does and report them through sweet_hid_touch. The rising-edge
 IRQ is polled from the TLMM's latch, with a slow timed read as a fallback.
-AppleCLCD reports the panel's power: the IC sleeps with it and gets its firmware
-again on wake, as nvt_ts_suspend/resume do. GPIO 36 (vibrator) is not touched.
+AppleCLCD reports the panel's power: the IC gets its firmware again on wake, as
+nvt_ts_resume does. No deep sleep command: it left the display black here.
+GPIO 36 (vibrator) is not touched.
 
 ---
 diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
-index 370d18b..0d57ae5 100644
+index 370d18b..820b026 100644
 --- a/bsd/dev/sweet_touch.c
 +++ b/bsd/dev/sweet_touch.c
 @@ -1,11 +1,23 @@
@@ -36,8 +37,8 @@ index 370d18b..0d57ae5 100644
 + * so that it stays out of this repository. Touch frames follow nvt_ts_work_func.
 + * The IRQ is a rising edge: the TLMM latches it in the pin's status register with
 + * no GIC interrupt, and a slow timed read covers an IRQ that never comes.
-+ * The IC shares the panel's power state: AppleCLCD reports it, and as in Android's
-+ * nvt_ts_suspend/resume the IC is put to sleep and gets its firmware again on wake.
++ * The IC shares the panel's power state: AppleCLCD reports it. As in Android's
++ * nvt_ts_resume the IC gets its firmware again on wake, but it is not told to sleep.
 + * Lines contain "TOUCH": read them with the shim's log viewer.
 + *
 + * GPIO 36 is the vibrator on fog: never touch it. GPIO 80 is only read.
@@ -866,23 +867,23 @@ index 370d18b..0d57ae5 100644
 +	if (wdt == 6) {
 +		st.wdt++;
 +		return false;
-+	}
-+	for (unsigned i = 0; i < NVT_FRAME_LEN - 1u; ++i) {
-+		sum = (uint8_t)(sum + d[i]);
  	}
 -	unsigned n = buf[2] & 15u;
 -	if (n > TOUCH_MAX) {
 -		(void)touch_goodix_ack();
 -		return EIO;
-+	if ((uint8_t)(~sum + 1u) != d[NVT_FRAME_LEN - 1u]) {
-+		st.bad_sum++;
-+		return false;
++	for (unsigned i = 0; i < NVT_FRAME_LEN - 1u; ++i) {
++		sum = (uint8_t)(sum + d[i]);
  	}
 -	if (n) {
 -		err = touch_read(0x5d, GOODIX_EVENT_REG + GOODIX_HEAD_LEN, true,
 -		    buf + GOODIX_HEAD_LEN, n * GOODIX_POINT_LEN + 2u);
 -		if (err) {
 -			return err;
++	if ((uint8_t)(~sum + 1u) != d[NVT_FRAME_LEN - 1u]) {
++		st.bad_sum++;
++		return false;
++	}
 +	for (unsigned i = 0; i < NVT_FINGERS; ++i) {
 +		const uint8_t *r = d + i * 6u;
 +		unsigned id = r[0] >> 3, state = r[0] & 7u;
@@ -1030,15 +1031,15 @@ index 370d18b..0d57ae5 100644
 +	}
 +}
 +
-+/* nvt_ts_suspend: the deep sleep command */
++/*
++ * Not nvt_ts_suspend's deep sleep command (0x11): this IC also drives the panel,
++ * and with it the display stayed black, as the wake path here is only DCS 0x11 and
++ * 0x29, not Android's full panel init. The IC is just left alone while it is off.
++ */
 +static void
 +nvt_sleep(void)
 +{
-+	uint8_t b = 0x11;
-+
 +	touch_up_all();
-+	nvt_set_page(NVT_EVENT_BUF);
-+	nvt_put(EVENT_HOST_CMD, &b, 1);
 +	st.sleeps++;
 +}
 +
